@@ -1,0 +1,15 @@
+[Addon]
+Name=TransIME (experimental)
+Name[zh_CN]=TransIME（实验）
+Type=SharedLibrary
+Library=libtransime
+Category=Module
+Version=@PROJECT_VERSION@
+OnDemand=False
+Configurable=True
+
+[Addon/Dependencies]
+0=core:@TRANSIME_FCITX_VERSION@
+
+[Addon/OptionalDependencies]
+0=pinyin:5.1.12

@@ -1,0 +1,81 @@
+--- a/qt6/platforminputcontext/qfcitxplatforminputcontext.h
++++ b/qt6/platforminputcontext/qfcitxplatforminputcontext.h
+@@ -51,6 +51,11 @@
+     int surroundingCursor = -1;
+     bool expectingMicroFocusChange = false;
+     bool eventFilter(QObject *watched, QEvent *event) override;
++    // Remember the field across temporary window deactivation. A null
++    // QPointer after destruction is deliberately different from a new field.
++    QPointer<QObject> draftOwner;
++    bool draftOwnerAssigned = false;
++
+ 
+ private:
+     QFcitxPlatformInputContext *context_;
+--- a/qt6/platforminputcontext/qfcitxplatforminputcontext.cpp
++++ b/qt6/platforminputcontext/qfcitxplatforminputcontext.cpp
+@@ -501,6 +501,14 @@
+ 
+ void QFcitxPlatformInputContext::commit() {
+     auto *proxy = validICByWindow(lastWindow_);
++    // Opt-in for panel-only composition: Qt calls commit during window
++    // deactivation, even when the client has no preedit to commit. This must
++    // not turn into cancellation of a server-side draft. Explicit reset()
++    // still always reaches the server; real field changes reset below.
++    if (get_boolean_env("TRANSIME_QT_PRESERVE_PANEL_DRAFT", false) &&
++        preeditList_.isEmpty()) {
++        return;
++    }
+     commitPreedit(lastObject_);
+     if (proxy) {
+         proxy->reset();
+@@ -522,6 +530,18 @@
+     }
+ 
+     auto *proxy = validICByWindow(lastWindow_);
++    if (get_boolean_env("TRANSIME_QT_PRESERVE_PANEL_DRAFT", false) &&
++        proxy && realFocusObject && focusWindowWrapper() == lastWindow_) {
++        FcitxQtICData &data = *static_cast<FcitxQtICData *>(
++            proxy->property("icData").value<void *>());
++        if (data.draftOwnerAssigned && data.draftOwner != realFocusObject) {
++            // Reset while the old field is still focused: Fcitx only resets
++            // the engine on a focused IC. Do not flash its draft in the new field.
++            proxy->reset();
++            data.resetCandidateWindow();
++            data.draftOwner = realFocusObject;
++        }
++    }
+     commitPreedit(lastObject_);
+     if (proxy) {
+         proxy->focusOut();
+@@ -548,6 +568,17 @@
+ 
+     if (proxy) {
+         proxy->focusIn();
++        if (get_boolean_env("TRANSIME_QT_PRESERVE_PANEL_DRAFT", false) &&
++            realFocusObject) {
++            FcitxQtICData &data = *static_cast<FcitxQtICData *>(
++                proxy->property("icData").value<void *>());
++            if (data.draftOwnerAssigned && data.draftOwner != realFocusObject) {
++                proxy->reset();
++                data.resetCandidateWindow();
++            }
++            data.draftOwner = realFocusObject;
++            data.draftOwnerAssigned = true;
++        }
+         // We need to delegate this otherwise it may cause self-recursion in
+         // certain application like libreoffice.
+         QTimer::singleShot(0, this,
+@@ -646,6 +677,12 @@
+         Q_UNUSED(uuid);
+ #endif
+         if (window && window == w) {
++            if (get_boolean_env("TRANSIME_QT_PRESERVE_PANEL_DRAFT", false)) {
++                // Initial IC creation is asynchronous; capture the current
++                // field here, not only on later focus transitions.
++                data->draftOwner = focusObjectWrapper();
++                data->draftOwnerAssigned = bool(data->draftOwner);
++            }
+             cursorRectChanged();
+             proxy->focusIn();
+         }

@@ -1,0 +1,10 @@
+{
+  "version": "terminology-holdout-v1",
+  "case_count": 24,
+  "author": "assistant",
+  "scope": "targeted one-word terminology; includes three mission-related followups so not independent of known development domain",
+  "code_frozen_before_authoring": true,
+  "predictions_seen_before_freeze": false,
+  "sha256": "794fbb86bbd4681e4720255dd4fb6d51d393d9907e587ca4935bb0c14696ebc1",
+  "status": "frozen; no parameter tuning against this set"
+}

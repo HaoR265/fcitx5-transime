@@ -1,0 +1,16 @@
+{
+  "case_count": 100,
+  "author": "assistant-authored synthetic scenarios",
+  "split": "heldout-v1",
+  "frozen_before_model_predictions": true,
+  "sha256": "75c30cce286d89393351ff35a52eaa667ffacb09c52185e2fa2570418910450c",
+  "contexts": {
+    "paired_english_commits": 75,
+    "ordinary_chinese_commits": 25
+  },
+  "constraint": "No tuning against these outputs while calling this split held out; later use for tuning retires the holdout label.",
+  "semantic_status": "assistant_semantic_review_complete_not_human_validated",
+  "reference_policy": "Examples are not exact-match grading targets; no human validation has occurred.",
+  "current_split_status": "retired_to_regression_after_observed_006_negation_error",
+  "review_report": "docs/heldout-v1-review.md"
+}

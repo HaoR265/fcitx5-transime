@@ -1,0 +1,12 @@
+# Python 3.12 / Linux x86_64; exact versions measured for this prototype.
+click==8.5.0
+cloudpickle==3.1.2
+ctranslate2==4.8.0
+joblib==1.6.0
+numpy==2.2.6
+pyyaml==6.0.3
+regex==2026.9.3
+sacremoses==0.1.1
+sentencepiece==0.2.1
+setuptools==84.0.0
+tqdm==4.70.0

@@ -1,0 +1,2153 @@
+diff --git a/im/pinyin/CMakeLists.txt b/im/pinyin/CMakeLists.txt
+--- a/im/pinyin/CMakeLists.txt
++++ b/im/pinyin/CMakeLists.txt
+@@ -8,6 +8,7 @@
+ )
+ 
+ add_fcitx5_addon(pinyin ${PINYIN_SOURCES})
++fcitx5_export_module(Pinyin TARGET pinyin BUILD_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}" HEADERS pinyin_public.h INSTALL)
+ target_link_libraries(pinyin Fcitx5::Core Fcitx5::Config LibIME::Pinyin Fcitx5::Module::Punctuation Fcitx5::Module::QuickPhrase Fcitx5::Module::Notifications Fcitx5::Module::Spell Fcitx5::Module::PinyinHelper Pthread::Pthread)
+ 
+ if (TARGET Fcitx5::Module::LuaAddonLoader)
+diff --git a/im/pinyin/pinyin.cpp b/im/pinyin/pinyin.cpp
+--- a/im/pinyin/pinyin.cpp
++++ b/im/pinyin/pinyin.cpp
+@@ -78,6 +78,8 @@
+ #include <libime/pinyin/pinyinprediction.h>
+ #include <libime/pinyin/shuangpinprofile.h>
+ #include <list>
++#include <limits>
++#include <atomic>
+ #include <memory>
+ #include <optional>
+ #include <ostream>
+@@ -105,6 +107,48 @@
+ 
+ #define PINYIN_DEBUG() FCITX_LOGC(pinyin, Debug)
+ #define PINYIN_ERROR() FCITX_LOGC(pinyin, Error)
++
++uint64_t nextParagraphDraftId() {
++    static std::atomic<uint64_t> sequence{0};
++    return ++sequence;
++}
++
++bool transimeSameSnapshot(const PinyinTransimeSnapshotV1 &a,
++                          const PinyinTransimeSnapshotV1 &b) {
++    return a.apiVersion == 1 && b.apiVersion == 1 && a.ready && b.ready &&
++           a.revision == b.revision && a.selectedText == b.selectedText &&
++           a.candidateText == b.candidateText && a.source == b.source &&
++           a.inputBytes == b.inputBytes &&
++           a.selectedInputBytes == b.selectedInputBytes &&
++           a.candidateInputEnd == b.candidateInputEnd &&
++           a.cursorBytes == b.cursorBytes && a.candidateIndex == b.candidateIndex;
++}
++
++bool transimeCommentIsSafe(const std::string &text) {
++    if (text.size() > 4096) {
++        return false;
++    }
++    if (text.empty()) {
++        return true; // Restore the saved comment, not a new translation.
++    }
++    if (utf8::lengthValidated(text) == utf8::INVALID_LENGTH) {
++        return false;
++    }
++    for (auto iter = text.begin(); iter != text.end();) {
++        uint32_t codepoint = 0;
++        iter = utf8::getNextChar(iter, text.end(), &codepoint);
++        // Keep annotations on one line and reject control/bidi/zero-width
++        // instructions. The caller additionally validates translation policy.
++        if (codepoint <= 0x1f || (codepoint >= 0x7f && codepoint <= 0x9f) ||
++            codepoint == 0x061c ||
++            (codepoint >= 0x200b && codepoint <= 0x200f) ||
++            (codepoint >= 0x2028 && codepoint <= 0x202e) ||
++            (codepoint >= 0x2060 && codepoint <= 0x206f) || codepoint == 0xfeff) {
++            return false;
++        }
++    }
++    return true;
++}
+ 
+ template <typename T>
+ std::unique_ptr<CandidateList>
+@@ -218,15 +262,55 @@
+ 
+ } // namespace
+ 
+-PinyinState::PinyinState(PinyinEngine *engine) : context_(engine->ime()) {
+-    context_.setMaxSentenceLength(35);
++PinyinState::PinyinState(PinyinEngine *engine) : engine_(engine) {
++    segments_.push_back({newContext(), {}});
++    standaloneContext_ = newContext();
++    transimeDraftId_ = nextParagraphDraftId();
++}
++std::unique_ptr<libime::PinyinContext> PinyinState::newContext() const {
++    auto context = std::make_unique<libime::PinyinContext>(engine_->ime());
++    context->setMaxSentenceLength(35);
++    return context;
++}
++bool PinyinState::hasDraft() const {
++    return std::any_of(segments_.begin(), segments_.end(), [](const auto &segment) {
++        return !segment.context->empty() || !segment.literal.empty();
++    });
++}
++size_t PinyinState::draftBytes() const {
++    size_t bytes = 0;
++    for (const auto &segment : segments_) {
++        // Both raw and Chinese byte bounds matter; each segment is bounded.
++        bytes += std::max(segment.context->userInput().size(),
++                          segment.context->sentence().size()) + segment.literal.size();
++    }
++    return bytes;
++}
++void PinyinState::clearParagraph() {
++    // Keep the first actual context alive until its pending UI owners are reset.
++    for (auto &segment : segments_) {
++        segment.context->clear();
++        segment.context->clearContextWords();
++        segment.literal.clear();
++    }
++    segments_.resize(1);
++    activeSegment_ = 0;
++    literalCursor_ = -1;
++    transimeAtCapacity_ = false;
++    transimeEnglish_ = false;
++    clearParagraphShift();
++    transimeDraftId_ = nextParagraphDraftId();
++    if (transimeDisablePending_) {
++        transimeHold_ = false;
++        transimeDisablePending_ = false;
++    }
+ }
+ 
+ void PinyinEngine::initPredict(InputContext *inputContext) {
+     auto *state = inputContext->propertyFor(&factory_);
+     // clear state no matter what.
+     state->predictWords_.reset();
+-    auto &context = state->context_;
++    auto &context = state->context();
+     auto lmState = context.state();
+     auto selected = context.selectedWords();
+     if (*config_.keepCurrentContext) {
+@@ -262,7 +346,7 @@
+     auto *state = inputContext->propertyFor(&factory_);
+     assert(state->predictWords_.has_value());
+     if (*config_.keepCurrentContext) {
+-        state->context_.setContextWords(*state->predictWords_);
++        state->context().setContextWords(*state->predictWords_);
+     }
+     auto words =
+         prediction_.predict(*state->predictWords_, *config_.predictionSize);
+@@ -306,12 +390,30 @@
+ 
+ std::pair<Text, Text> PinyinEngine::preedit(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&factory_);
++    if (state->paragraphActive()) {
++        Text paragraph;
++        std::string text;
++        size_t cursor = 0;
++        for (size_t i = 0; i < state->segments_.size(); ++i) {
++            const auto &segment = state->segments_[i];
++            auto [part, localCursor] = segment.context->preeditWithCursor();
++            if (i == state->activeSegment_) {
++                cursor = text.size() + (state->literalCursor_ < 0
++                    ? localCursor : part.size() + static_cast<size_t>(state->literalCursor_));
++            }
++            text += part;
++            text += segment.literal;
++        }
++        paragraph.append(text);
++        paragraph.setCursor(cursor);
++        return {Text(), std::move(paragraph)};
++    }
+     PreeditMode mode =
+         inputContext->capabilityFlags().test(CapabilityFlag::Preedit)
+             ? *config_.preeditMode
+             : PreeditMode::No;
+     // Use const ref to avoid accidentally change anything.
+-    const auto &context = state->context_;
++    const auto &context = state->context();
+     auto preeditWithCursor = context.preeditWithCursor();
+     // client preedit can be empty/pinyin/preview depends on config
+     Text clientPreedit;
+@@ -352,7 +454,7 @@
+ PinyinEngine::preeditCommitString(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&factory_);
+     // Use const ref to avoid accidentally change anything.
+-    const auto &context = state->context_;
++    const auto &context = state->context();
+ 
+     const auto &userInput = context.userInput();
+     const auto selectedLength = context.selectedLength();
+@@ -415,27 +517,41 @@
+ }
+ 
+ void PinyinEngine::updateUI(InputContext *inputContext) {
++    // Explicit paragraph confirmation/literal insertion invokes native select
++    // on known candidate classes, but stages the resulting UI only once.
++    if (inputContext->propertyFor(&factory_)->transimeSelecting_) return;
+     inputContext->inputPanel().reset();
+ 
+     auto *state = inputContext->propertyFor(&factory_);
++    ++state->transimeRevision_;
++    ++state->transimeCandidateEpoch_;
+     // Use const ref to avoid accidentally change anything.
+-    const auto &context = state->context_;
+-    if (context.selected()) {
++    const auto &context = state->context();
++    if (context.selected() && !state->paragraphActive()) {
+         auto sentence = context.sentence();
+         if (!inputContext->capabilityFlags().testAny(
+                 CapabilityFlag::PasswordOrSensitive)) {
+-            state->context_.learn();
++            state->context().learn();
+         }
+         inputContext->commitString(sentence);
+         inputContext->updatePreedit();
+         inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+         initPredict(inputContext);
+-        state->context_.clear();
++        state->context().clear();
+         return;
+     }
+ 
+     do {
+-        if (context.userInput().empty()) {
++        if (state->paragraphActive()) {
++            updatePreedit(inputContext);
++            if (state->transimeAtCapacity_) {
++                inputContext->inputPanel().setAuxUp(Text("段落已达上限，请确认或继续编辑"));
++            } else if (state->transimeEnglish_ && state->transimeControls_.showModeHints) {
++                inputContext->inputPanel().setAuxUp(Text("英文"));
++            }
++        }
++        if (context.userInput().empty() || (state->paragraphActive() && context.selected()) ||
++            (state->paragraphActive() && state->literalCursor_ >= 0)) {
+             break;
+         }
+         // Update Preedit.
+@@ -527,7 +643,7 @@
+         /// }}}
+ 
+         /// Create spell candidate {{{
+-        auto [parsedPy, parsedPyCursor] = state->context_.preeditWithCursor(
++        auto [parsedPy, parsedPyCursor] = state->context().preeditWithCursor(
+             libime::PinyinPreeditMode::RawText);
+         if (*config_.spellEnabled && spell() &&
+             parsedPyCursor >= selectedSentence.size() &&
+@@ -675,6 +791,859 @@
+     } while (0);
+     inputContext->updatePreedit();
+     inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
++}
++
++PinyinTransimeSnapshotV1
++PinyinEngine::transimeSnapshotV1(InputContext *inputContext) const {
++    const auto candidateList = inputContext
++                                   ? inputContext->inputPanel().candidateList()
++                                   : nullptr;
++    const auto index = candidateList ? candidateList->cursorIndex() : -1;
++    auto snapshot = transimeSnapshotAtV1(inputContext, index);
++    if (snapshot.reason == "invalid-page-index") {
++        snapshot.reason = "no-highlighted-candidate";
++    }
++    return snapshot;
++}
++
++PinyinTransimeSnapshotV1
++PinyinEngine::transimeSnapshotAtV1(InputContext *inputContext, int pageIndex) const {
++    return transimeSnapshotAtImpl(inputContext, pageIndex, false);
++}
++PinyinTransimeSnapshotV1
++PinyinEngine::transimeSnapshotAtImpl(InputContext *inputContext, int pageIndex,
++                                   bool allowHold) const {
++    PinyinTransimeSnapshotV1 snapshot;
++    if (!inputContext || !inputContext->hasFocus()) {
++        return snapshot;
++    }
++    if (instance_->inputMethod(inputContext) != "pinyin") {
++        snapshot.reason = "unsupported-input-method";
++        return snapshot;
++    }
++    if (inputContext->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
++        snapshot.reason = "sensitive";
++        return snapshot;
++    }
++    const auto *state = inputContext->propertyFor(&factory_);
++    snapshot.revision = state->transimeRevision_;
++    if (state->transimeHold_ && !allowHold) {
++        snapshot.reason = "paragraph-hold";
++        return snapshot;
++    }
++    const auto &context = state->context();
++    if (state->mode_ != PinyinMode::Normal || state->predictWords_) {
++        snapshot.reason = "unsupported-mode";
++        return snapshot;
++    }
++    if (context.empty() || context.selected() || context.useShuangpin()) {
++        snapshot.reason = "no-pending-pinyin";
++        return snapshot;
++    }
++    // At the end, candidatesToCursor() aliases candidates(). Reading the latter
++    // avoids even libime's lazy candidate-to-cursor cache update.
++    if (context.cursor() != context.size()) {
++        snapshot.reason = "cursor-not-at-end";
++        return snapshot;
++    }
++    const auto &input = context.userInput();
++    if (input.size() != context.size() ||
++        std::any_of(input.begin(), input.end(), [](unsigned char c) { return c >= 0x80; })) {
++        snapshot.reason = "unsupported-input-encoding";
++        return snapshot;
++    }
++    const auto selectedLength = context.selectedLength();
++    if (selectedLength >= input.size()) {
++        snapshot.reason = "no-unselected-input";
++        return snapshot;
++    }
++    const auto candidateList = inputContext->inputPanel().candidateList();
++    if (!candidateList || pageIndex < 0 || pageIndex >= candidateList->size()) {
++        snapshot.reason = "invalid-page-index";
++        return snapshot;
++    }
++    const auto &word = candidateList->candidate(pageIndex);
++    // This cast stays inside the engine that owns the candidate types. Clients
++    // use only the public value snapshot and never access pinyinState.
++    const auto *candidate = dynamic_cast<const PinyinCandidateWord *>(&word);
++    if (!candidate || candidate->engine_ != this ||
++        candidate->inputContext_ != inputContext) {
++        snapshot.reason = "unsupported-candidate";
++        return snapshot;
++    }
++    if (state->paragraphActive() &&
++        (candidate->transimeContextIdentity_ != &context ||
++         candidate->transimeCandidateEpoch_ != state->transimeCandidateEpoch_)) {
++        snapshot.reason = "stale-candidate-context";
++        return snapshot;
++    }
++    const auto index = candidate->candidateIndex();
++    const auto &candidates = context.candidates();
++    if (index >= candidates.size() || index > static_cast<size_t>(std::numeric_limits<int>::max())) {
++        snapshot.reason = "stale-candidate";
++        return snapshot;
++    }
++    const auto &result = candidates[index];
++    const auto remaining = input.size() - selectedLength;
++    if (result.sentence().empty() || candidate->selectLength() != remaining ||
++        result.sentence().back()->to()->index() != remaining) {
++        snapshot.reason = "partial-candidate";
++        return snapshot;
++    }
++    const auto candidateText = result.toString();
++    if (candidateText.empty() || candidateText != candidate->text().toString() ||
++        getEncodedPinyin(result).empty()) {
++        snapshot.reason = "stale-or-non-pinyin-candidate";
++        return snapshot;
++    }
++    // Do not claim a custom selected prefix has ordinary pinyin provenance.
++    const auto selectedWords = context.selectedWordsWithPinyin();
++    if (std::any_of(selectedWords.begin(), selectedWords.end(), [](const auto &word) {
++            return !word.first.empty() && word.second.empty();
++        })) {
++        snapshot.reason = "unsupported-selected-prefix";
++        return snapshot;
++    }
++    snapshot.selectedText = context.selectedSentence();
++    snapshot.candidateText = candidateText;
++    snapshot.source = snapshot.selectedText + snapshot.candidateText;
++    snapshot.inputBytes = input.size();
++    snapshot.selectedInputBytes = selectedLength;
++    snapshot.candidateInputEnd = selectedLength + candidate->selectLength();
++    snapshot.cursorBytes = context.cursor();
++    snapshot.candidateIndex = static_cast<int>(index);
++    snapshot.ready = true;
++    snapshot.reason = "ready";
++    return snapshot;
++}
++
++bool PinyinEngine::transimeSetCommentV1(InputContext *inputContext, int pageIndex,
++                                       PinyinTransimeSnapshotV1 expected,
++                                       std::string translation) const {
++    if (!inputContext || pageIndex < 0 || !transimeCommentIsSafe(translation)) {
++        return false;
++    }
++    auto *state = inputContext->propertyFor(&factory_);
++    auto &annotations = state->transimeComments_;
++    // No candidate-list traversal: visit at most ten already annotated objects.
++    std::erase_if(annotations, [](const auto &weak) {
++        const auto handle = weak.lock();
++        return !handle || !handle->candidate ||
++               !handle->candidate->transimeCommentSnapshot();
++    });
++    if (translation.empty()) {
++        for (auto iter = annotations.begin(); iter != annotations.end(); ++iter) {
++            const auto handle = iter->lock();
++            auto *saved = handle ? handle->candidate : nullptr;
++            if (saved && handle->pageIndex == pageIndex &&
++                saved->engine_ == this && saved->inputContext_ == inputContext &&
++                transimeSameSnapshot(expected, *saved->transimeCommentSnapshot())) {
++                // Restore the same still-live object even if a mouse click
++                // already changed pages before the Module observed UpdateUI.
++                saved->setTransimeComment(pageIndex, expected, {});
++                annotations.erase(iter);
++                return true;
++            }
++        }
++    }
++    const auto candidateList = inputContext->inputPanel().candidateList();
++    if (!candidateList || pageIndex >= candidateList->size()) {
++        return false;
++    }
++    const auto *candidate = dynamic_cast<const PinyinCandidateWord *>(
++        &candidateList->candidate(pageIndex));
++    if (!candidate || candidate->engine_ != this ||
++        candidate->inputContext_ != inputContext) {
++        return false;
++    }
++    const auto actual = transimeSnapshotAtV1(inputContext, pageIndex);
++    if (!transimeSameSnapshot(expected, actual)) {
++        return false;
++    }
++    if (translation.empty()) {
++        // An unannotated current candidate supports a harmless capability probe.
++        // Never clear an annotation using a different generation's snapshot.
++        return !candidate->transimeCommentSnapshot();
++    }
++    const bool registered = std::any_of(annotations.begin(), annotations.end(),
++        [candidate](const auto &weak) {
++            const auto handle = weak.lock();
++            return handle && handle->candidate == candidate;
++        });
++    if (!registered && annotations.size() >= 10) {
++        return false;
++    }
++    // CandidateList exposes a const reference, but the pinyin-owned candidate
++    // object itself is mutable. Never cast external or special candidate types.
++    const_cast<PinyinCandidateWord *>(candidate)->setTransimeComment(
++        pageIndex, expected, std::move(translation));
++    if (!registered) {
++        annotations.push_back(candidate->transimeCommentHandle());
++    }
++    return true;
++}
++
++namespace {
++bool sameParagraph(const PinyinTransimeParagraphSnapshotV2 &a,
++                   const PinyinTransimeParagraphSnapshotV2 &b) {
++    return a.apiVersion == 2 && b.apiVersion == 2 && a.hold && b.hold &&
++           a.hasDraft == b.hasDraft && a.ready == b.ready &&
++           a.fullySelected == b.fullySelected && a.draftId == b.draftId &&
++           a.revision == b.revision && a.activeSegment == b.activeSegment &&
++           a.cursorBytes == b.cursorBytes && a.pageIndex == b.pageIndex &&
++           a.source == b.source && a.rawInput == b.rawInput &&
++           (a.activeCandidate.ready ? transimeSameSnapshot(a.activeCandidate, b.activeCandidate)
++                                    : !b.activeCandidate.ready);
++}
++size_t previousUtf8(const std::string &text, size_t offset) {
++    if (!offset) return 0;
++    --offset;
++    while (offset && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) --offset;
++    return offset;
++}
++size_t nextUtf8(const std::string &text, size_t offset) {
++    if (offset >= text.size()) return text.size();
++    ++offset;
++    while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
++    return offset;
++}
++}
++
++bool PinyinEngine::transimeSetControlsV1(InputContext *ic, PinyinTransimeControlsV1 controls) {
++    if (!ic || controls.chineseCommit.empty() || controls.rawCommit.empty() ||
++        controls.literalSpace.empty() || !transimeValidControlKeys({
++            controls.chineseCommit, controls.rawCommit, controls.literalSpace})) return false;
++    auto *state = ic->propertyFor(&factory_);
++    const bool hintsChanged = state->transimeControls_.showModeHints != controls.showModeHints;
++    controls.chineseCommit = transimeNormalizeControlKeys(std::move(controls.chineseCommit));
++    controls.rawCommit = transimeNormalizeControlKeys(std::move(controls.rawCommit));
++    controls.literalSpace = transimeNormalizeControlKeys(std::move(controls.literalSpace));
++    state->transimeControls_ = std::move(controls);
++    if (hintsChanged && state->paragraphActive() && ic->hasFocus()) updateParagraphModeUI(ic);
++    return true;
++}
++
++int PinyinEngine::transimeSetHoldV1(InputContext *ic, bool enabled) {
++    if (!ic) return 3;
++    auto *state = ic->propertyFor(&factory_);
++    if (!enabled) {
++        if (state->transimeHold_ && state->hasDraft()) {
++            state->transimeDisablePending_ = true;
++            return 2;
++        }
++        const bool hadEnglish = state->transimeEnglish_;
++        state->transimeHold_ = false;
++        state->transimeDisablePending_ = false;
++        state->transimeEnglish_ = false;
++        state->clearParagraphShift();
++        if (hadEnglish && ic->hasFocus()) updateParagraphModeUI(ic);
++        return 0;
++    }
++    if (!ic->hasFocus()) return state->transimeHold_ ? 1 : 3;
++    if (instance_->inputMethod(ic) != "pinyin" ||
++        ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive) ||
++        state->mode_ != PinyinMode::Normal || state->context().useShuangpin() ||
++        state->draftBytes() > 4096) return 3;
++    state->transimeDisablePending_ = false;
++    state->transimeSuspended_ = false;
++    if (!state->transimeHold_) {
++        state->transimeHold_ = true;
++        state->predictWords_.reset();
++        ++state->transimeRevision_;
++        updateUI(ic);
++    }
++    return 1;
++}
++
++PinyinTransimeParagraphSnapshotV2
++PinyinEngine::transimeParagraphSnapshotV2(InputContext *ic, int pageIndex) const {
++    PinyinTransimeParagraphSnapshotV2 out;
++    if (!ic) return out;
++    const auto *state = ic->propertyFor(&factory_);
++    out.hold = state->transimeHold_;
++    out.draftId = state->transimeDraftId_;
++    out.revision = state->transimeRevision_;
++    out.activeSegment = state->activeSegment_;
++    out.hasDraft = state->hasDraft();
++    if (!out.hold) { out.reason = "hold-disabled"; return out; }
++    if (!ic->hasFocus() || instance_->inputMethod(ic) != "pinyin") {
++        out.reason = "suspended"; return out;
++    }
++    if (ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
++        out.reason = "sensitive"; return out;
++    }
++    if (state->mode_ != PinyinMode::Normal) { out.reason = "unsupported-mode"; return out; }
++    auto [unused, rendered] = preedit(ic);
++    out.cursorBytes = rendered.cursor();
++    out.ready = out.hasDraft;
++    out.fullySelected = true;
++    const auto list = ic->inputPanel().candidateList();
++    const int requested = pageIndex >= 0 ? pageIndex : (list ? list->cursorIndex() : -1);
++    for (size_t index = 0; index < state->segments_.size(); ++index) {
++        const auto &segment = state->segments_[index];
++        const auto &context = *segment.context;
++        out.rawInput += context.userInput();
++        out.rawInput += segment.literal;
++        if (context.empty()) {
++            // Literal-only paragraph is valid and bounded.
++        } else if (context.selected()) {
++            out.source += context.selectedSentence();
++        } else {
++            out.fullySelected = false;
++            if (index == state->activeSegment_ && state->literalCursor_ < 0) {
++                auto candidate = transimeSnapshotAtImpl(ic, requested, true);
++                if (candidate.ready) {
++                    out.source += candidate.source;
++                    out.activeCandidate = std::move(candidate);
++                    out.pageIndex = requested;
++                } else {
++                    out.ready = false;
++                    out.reason = candidate.reason;
++                    out.source += context.selectedSentence() + context.userInput().substr(context.selectedLength());
++                }
++            } else {
++                out.ready = false;
++                out.reason = "unresolved-other-segment";
++                out.source += context.selectedSentence() + context.userInput().substr(context.selectedLength());
++            }
++        }
++        out.source += segment.literal;
++    }
++    if (pageIndex >= 0 && !out.activeCandidate.ready) {
++        out.ready = false;
++        out.reason = "no-pending-candidate";
++    }
++    if (out.source.size() > 4096 || out.rawInput.size() > 4096) {
++        out.ready = false;
++        out.reason = "capacity";
++    }
++    if (out.ready) out.reason = "ready";
++    else if (!out.hasDraft) out.reason = "empty";
++    return out;
++}
++
++bool PinyinEngine::paragraphSelectCurrent(InputContext *ic) {
++    auto *state = ic->propertyFor(&factory_);
++    auto &context = state->context();
++    if (context.empty() || context.selected()) return true;
++    const auto list = ic->inputPanel().candidateList();
++    if (list && list->cursorIndex() >= 0) {
++        // This is a real selection; the native candidate implements custom and
++        // ordinary selection without rebuilding an external selection stack.
++        const auto &candidate = list->candidate(list->cursorIndex());
++        const auto *pinyin = dynamic_cast<const PinyinCandidateWord *>(&candidate);
++        if (pinyin && pinyin->engine_ == this && pinyin->inputContext_ == ic) {
++            const auto &candidates = context.candidatesToCursor();
++            if (pinyin->idx_ < candidates.size()) context.selectCandidatesToCursor(pinyin->idx_);
++        } else if (dynamic_cast<const CustomPhraseCandidateWord *>(&candidate) ||
++                   dynamic_cast<const LuaCandidateWord *>(&candidate) ||
++                   dynamic_cast<const SymbolCandidateWord *>(&candidate) ||
++                   dynamic_cast<const SpellCandidateWord *>(&candidate) ||
++                   dynamic_cast<const StrokeCandidateWord *>(&candidate)) {
++            if (state->draftBytes() + candidate.text().toString().size() > 4096) {
++                state->transimeAtCapacity_ = true;
++                return false;
++            }
++            state->transimeSelecting_ = true;
++            try { candidate.select(ic); }
++            catch (...) { state->transimeSelecting_ = false; throw; }
++            state->transimeSelecting_ = false;
++        }
++    }
++    return true;
++}
++
++bool PinyinEngine::transimeCommitParagraphV2(InputContext *ic,
++    PinyinTransimeParagraphSnapshotV2 expected, PinyinTransimeCommitModeV2 mode,
++    std::string translation) {
++    if (!ic || !expected.hasDraft || !ic->hasFocus() ||
++        instance_->inputMethod(ic) != "pinyin" ||
++        ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) return false;
++    const auto actual = transimeParagraphSnapshotV2(ic, expected.pageIndex);
++    if (!sameParagraph(expected, actual)) return false;
++    if (mode != PinyinTransimeCommitModeV2::Chinese && mode != PinyinTransimeCommitModeV2::Raw &&
++        mode != PinyinTransimeCommitModeV2::Translation) return false;
++    if (mode == PinyinTransimeCommitModeV2::Translation &&
++        (!actual.ready || translation.empty() || !transimeCommentIsSafe(translation))) return false;
++    auto *state = ic->propertyFor(&factory_);
++    std::string output;
++    if (mode == PinyinTransimeCommitModeV2::Raw) output = actual.rawInput;
++    else if (mode == PinyinTransimeCommitModeV2::Translation) output = std::move(translation);
++    else {
++        // Explicit Chinese confirmation alone may learn the native Chinese
++        // contexts. Unknown raw pieces remain visible instead of being lost.
++        if (!paragraphSelectCurrent(ic)) { updateUI(ic); return false; }
++        for (auto &segment : state->segments_) {
++            auto &context = *segment.context;
++            if (!context.empty() && !context.selected()) {
++                context.setCursor(context.size());
++                if (!context.candidates().empty()) context.select(0);
++            }
++            output += context.selectedSentence();
++            output += context.userInput().substr(context.selectedLength());
++            output += segment.literal;
++        }
++        if (output.size() > 4096) return false;
++    }
++    if (output.empty() || output.size() > 4096) return false;
++    // Frontends already block events while dispatching keys; Fcitx's blocker
++    // cannot nest. Clear internal state without emitting callbacks, enqueue the
++    // confirmed output first, then update UI through a weak IC. Client preedit
++    // has always been empty in hold mode. This is not an application receipt.
++    auto weakIC = ic->watch();
++    if (mode == PinyinTransimeCommitModeV2::Chinese) {
++        for (auto &segment : state->segments_) {
++            if (segment.context->selected()) segment.context->learn();
++        }
++    }
++    ic->inputPanel().reset();
++    state->clearParagraph();
++    state->predictWords_.reset();
++    ++state->transimeRevision_;
++    ic->commitString(output);
++    if (auto *live = weakIC.get()) {
++        live->updatePreedit();
++        if ((live = weakIC.get())) live->updateUserInterface(UserInterfaceComponent::InputPanel);
++    }
++    return true;
++}
++
++bool PinyinEngine::transimeCancelParagraphV1(InputContext *ic, uint64_t draftId) {
++    if (!ic) return false;
++    auto *state = ic->propertyFor(&factory_);
++    if (!state->transimeHold_ || draftId != state->transimeDraftId_) return false;
++    doReset(ic);
++    return true;
++}
++
++bool PinyinEngine::transimeSetParagraphCommentV2(InputContext *ic, int pageIndex,
++    PinyinTransimeParagraphSnapshotV2 expected, std::string translation) const {
++    if (!ic || pageIndex < 0 || !transimeCommentIsSafe(translation)) return false;
++    auto *state = ic->propertyFor(&factory_);
++    auto &annotations = state->transimeComments_;
++    std::erase_if(annotations, [](const auto &weak) {
++        auto handle = weak.lock();
++        return !handle || !handle->candidate || !handle->candidate->transimeCommentSnapshot();
++    });
++    if (translation.empty()) {
++        for (auto it = annotations.begin(); it != annotations.end(); ++it) {
++            auto handle = it->lock();
++            auto *candidate = handle ? handle->candidate : nullptr;
++            if (candidate && candidate->engine_ == this && candidate->inputContext_ == ic &&
++                handle->pageIndex == pageIndex && candidate->transimeParagraphCommentSnapshot_ &&
++                sameParagraph(expected, *candidate->transimeParagraphCommentSnapshot_)) {
++                candidate->setTransimeComment(pageIndex, expected.activeCandidate, {});
++                annotations.erase(it);
++                return true;
++            }
++        }
++    }
++    auto actual = transimeParagraphSnapshotV2(ic, pageIndex);
++    if (!actual.ready || !actual.activeCandidate.ready || !sameParagraph(expected, actual)) return false;
++    auto list = ic->inputPanel().candidateList();
++    if (!list || pageIndex >= list->size()) return false;
++    auto *candidate = dynamic_cast<const PinyinCandidateWord *>(&list->candidate(pageIndex));
++    if (!candidate || candidate->engine_ != this || candidate->inputContext_ != ic) return false;
++    if (translation.empty()) return !candidate->transimeCommentSnapshot();
++    const bool registered = std::any_of(annotations.begin(), annotations.end(), [candidate](const auto &weak) {
++        auto handle = weak.lock(); return handle && handle->candidate == candidate;
++    });
++    if (!registered && annotations.size() >= 10) return false;
++    auto *mutableCandidate = const_cast<PinyinCandidateWord *>(candidate);
++    mutableCandidate->setTransimeComment(pageIndex, actual.activeCandidate, std::move(translation));
++    mutableCandidate->transimeParagraphCommentSnapshot_ = actual;
++    if (!registered) annotations.push_back(candidate->transimeCommentHandle());
++    return true;
++}
++
++void PinyinEngine::paragraphSetCursor(InputContext *ic, size_t unicodeCursor) {
++    auto *state = ic->propertyFor(&factory_);
++    for (size_t index = 0; index < state->segments_.size(); ++index) {
++        auto &segment = state->segments_[index];
++        auto &context = *segment.context;
++        const auto rendered = context.preeditWithCursor().first;
++        const size_t nativeChars = utf8::length(rendered);
++        const size_t literalChars = utf8::length(segment.literal);
++        if (unicodeCursor <= nativeChars) {
++            state->activeSegment_ = index;
++            state->literalCursor_ = -1;
++            while (context.selectedLength() && utf8::length(context.selectedSentence()) > unicodeCursor) context.cancel();
++            context.setCursor(context.selectedLength());
++            while (context.cursor() < context.size()) {
++                auto [text, cursor] = context.preeditWithCursor();
++                if (utf8::length(text.begin(), text.begin() + cursor) >= unicodeCursor) break;
++                context.setCursor(context.cursor() + 1);
++            }
++            return;
++        }
++        unicodeCursor -= nativeChars;
++        if (unicodeCursor <= literalChars) {
++            state->activeSegment_ = index;
++            size_t byte = 0;
++            for (size_t count = 0; count < unicodeCursor; ++count) byte = nextUtf8(segment.literal, byte);
++            state->literalCursor_ = byte;
++            return;
++        }
++        unicodeCursor -= literalChars;
++    }
++}
++
++bool PinyinEngine::paragraphInsertLiteral(InputContext *ic, const std::string &literal) {
++    auto *state = ic->propertyFor(&factory_);
++    if (literal.empty() || !transimeCommentIsSafe(literal)) return false;
++    if (state->draftBytes() + literal.size() > 4096) {
++        state->transimeAtCapacity_ = true;
++        return false;
++    }
++    if (state->literalCursor_ < 0) {
++        auto &context = state->context();
++        const size_t cursor = context.cursor();
++        // Split only the unselected raw suffix. Native selected items on the
++        // left stay in the same PinyinContext and keep their cancel stack.
++        std::string suffix;
++        if (cursor < context.size()) suffix = context.userInput().substr(cursor);
++        if (!suffix.empty() && state->segments_.size() >= 32) {
++            state->transimeAtCapacity_ = true;
++            return false;
++        }
++        if (!suffix.empty()) context.erase(cursor, context.size());
++        else if (!paragraphSelectCurrent(ic)) return false;
++        context.setCursor(context.size());
++        if (!context.empty() && !context.selected() && !context.candidates().empty()) context.select(0);
++        if (!suffix.empty()) {
++            PinyinState::Segment next{state->newContext(), {}};
++            next.context->type(suffix);
++            next.literal = std::move(state->segments_[state->activeSegment_].literal);
++            state->segments_.insert(state->segments_.begin() + state->activeSegment_ + 1, std::move(next));
++        }
++        state->literalCursor_ = 0;
++    }
++    auto &segment = state->segments_[state->activeSegment_];
++    segment.literal.insert(static_cast<size_t>(state->literalCursor_), literal);
++    state->literalCursor_ += literal.size();
++    state->transimeAtCapacity_ = false;
++    return true;
++}
++
++void PinyinEngine::updateParagraphModeUI(InputContext *ic) const {
++    auto *state = ic->propertyFor(&factory_);
++    // Do not rebuild the candidate list on a mode toggle: the first literal
++    // must confirm the actual highlighted candidate, including a Down choice.
++    ++state->transimeRevision_;
++    if (state->transimeAtCapacity_) {
++        ic->inputPanel().setAuxUp(Text("段落已达上限，请确认或继续编辑"));
++    } else if (state->transimeEnglish_ && state->transimeControls_.showModeHints) {
++        ic->inputPanel().setAuxUp(Text("英文"));
++    } else {
++        ic->inputPanel().setAuxUp(Text());
++    }
++    ic->updateUserInterface(UserInterfaceComponent::InputPanel);
++}
++
++void PinyinEngine::toggleParagraphMode(InputContext *ic) const {
++    auto *state = ic->propertyFor(&factory_);
++    state->transimeEnglish_ = !state->transimeEnglish_;
++    updateParagraphModeUI(ic);
++}
++
++bool PinyinEngine::handleParagraphModeKey(KeyEvent &event) {
++    auto *ic = event.inputContext();
++    auto *state = ic->propertyFor(&factory_);
++    if (!state->paragraphActive() || !ic->hasFocus() ||
++        ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive) ||
++        state->mode_ != PinyinMode::Normal) {
++        state->clearParagraphShift();
++        return false;
++    }
++    // raw/orig states retain Repeat and non-normalized modifiers. key() alone
++    // drops both Repeat and Shift on letters and is insufficient for tap logic.
++    const auto raw = event.rawKey();
++    const auto modifiers = raw.states() | event.origKey().states();
++    const bool repeat = modifiers.test(KeyState::Repeat);
++    const bool otherModifier = modifiers.testAny(KeyStates{
++        KeyState::Ctrl, KeyState::Alt, KeyState::Super, KeyState::Super2,
++        KeyState::Hyper, KeyState::Hyper2, KeyState::Meta, KeyState::Mod5,
++        KeyState::MousePressed});
++    const auto sym = event.key().sym();
++    // Consume the release/repeats of a custom confirmation even when its
++    // modifiers have already been released or confirmation emptied the draft.
++    if (state->transimeConfirmKey_ == sym) {
++        event.filterAndAccept();
++        if (event.isRelease()) state->transimeConfirmKey_ = FcitxKey_None;
++        return true;
++    }
++    if (!event.isRelease() && (event.key().checkKeyList(state->transimeControls_.chineseCommit) ||
++                              event.key().checkKeyList(state->transimeControls_.rawCommit))) {
++        state->transimeShiftTap_ = FcitxKey_None;
++        state->transimeShiftTapTime_ = 0;
++        return handleParagraphKey(event);
++    }
++    // Own the matching release even if Ctrl was released first. Repeated
++    // presses must neither toggle twice nor fall through as a Chinese Space.
++    if (sym == FcitxKey_space && state->transimeModeSpaceDown_) {
++        if (event.isRelease()) state->transimeModeSpaceDown_ = false;
++        state->transimeShiftTap_ = FcitxKey_None;
++        state->transimeShiftTapTime_ = 0;
++        event.filterAndAccept();
++        return true;
++    }
++    if (!event.isRelease() && sym == FcitxKey_space && state->hasDraft() &&
++        event.key().check(FcitxKey_space, KeyState::Ctrl) &&
++        !modifiers.testAny(KeyStates{KeyState::Alt, KeyState::Shift, KeyState::Super,
++            KeyState::Super2, KeyState::Hyper, KeyState::Hyper2, KeyState::Meta,
++            KeyState::Mod5, KeyState::MousePressed})) {
++        state->transimeModeSpaceDown_ = true;
++        state->transimeShiftTap_ = FcitxKey_None;
++        state->transimeShiftTapTime_ = 0;
++        event.filterAndAccept();
++        if (!repeat) toggleParagraphMode(ic);
++        return true;
++    }
++    const uint8_t shift = sym == FcitxKey_Shift_L ? 1 : sym == FcitxKey_Shift_R ? 2 : 0;
++    if (!shift) {
++        // Any other key, including another modifier or its release, cancels
++        // this tap. A following Shift release must not toggle literal mode.
++        state->transimeShiftTap_ = FcitxKey_None;
++        state->transimeShiftTapTime_ = 0;
++        if (!event.isRelease() && event.key().checkKeyList(state->transimeControls_.literalSpace)) {
++            event.filterAndAccept();
++            state->transimeConfirmKey_ = sym;
++            paragraphInsertLiteral(ic, " ");
++            updateUI(ic);
++            return true;
++        }
++        const auto codepoint = Key::keySymToUnicode(sym);
++        if (!event.isRelease() && !otherModifier && codepoint >= 0x21 && codepoint != 0x7f &&
++            (state->transimeEnglish_ || (codepoint >= 'A' && codepoint <= 'Z'))) {
++            // Native optional 2nd/3rd selection keys must not consume literal
++            // digits/punctuation before the regular engine key handler.
++            return handleParagraphKey(event);
++        }
++        return false;
++    }
++
++    if (!event.isRelease()) {
++        const bool singlePress = state->transimeShiftDown_ == 0 &&
++                                 !modifiers.test(KeyState::Shift);
++        state->transimeShiftDown_ |= shift;
++        if (singlePress && !otherModifier && !repeat) {
++            state->transimeShiftTap_ = sym;
++            state->transimeShiftTapTime_ = now(CLOCK_MONOTONIC);
++        } else {
++            state->transimeShiftTap_ = FcitxKey_None;
++            state->transimeShiftTapTime_ = 0;
++        }
++        // Forward the balanced physical modifier to the client, while stopping
++        // Fcitx's later global Shift trigger and native 2nd/3rd selection.
++        event.filter();
++        return true;
++    }
++
++    const bool toggle = state->transimeShiftDown_ == shift &&
++                        state->transimeShiftTap_ == sym && !otherModifier && !repeat &&
++                        instance_->globalConfig().checkModifierOnlyKeyTimeout(
++                            state->transimeShiftTapTime_);
++    state->transimeShiftDown_ &= ~shift;
++    state->transimeShiftTap_ = FcitxKey_None;
++    state->transimeShiftTapTime_ = 0;
++    event.filter();
++    if (toggle) toggleParagraphMode(ic);
++    return true;
++}
++
++bool PinyinEngine::handleParagraphKey(KeyEvent &event) {
++    auto *ic = event.inputContext();
++    auto *state = ic->propertyFor(&factory_);
++    if (event.isRelease() || event.key().isModifier()) return false;
++    if (ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
++        doReset(ic);
++        return false;
++    }
++    const auto &key = event.key();
++    const bool hasDraft = state->hasDraft();
++    if (key.checkKeyList(state->transimeControls_.chineseCommit) ||
++        key.checkKeyList(state->transimeControls_.rawCommit)) {
++        if (!hasDraft) {
++            if (state->transimeEnglish_) {
++                state->transimeEnglish_ = false;
++                updateParagraphModeUI(ic);
++            }
++            return false;
++        }
++        const auto mode = key.checkKeyList(state->transimeControls_.chineseCommit)
++            ? PinyinTransimeCommitModeV2::Chinese : PinyinTransimeCommitModeV2::Raw;
++        auto snapshot = transimeParagraphSnapshotV2(ic, -1);
++        state->transimeConfirmKey_ = key.sym();
++        event.filterAndAccept();
++        transimeCommitParagraphV2(ic, snapshot, mode, {});
++        return true;
++    }
++    // After rebinding confirmation, former bare keys must not reach the
++    // application (Return could send a message while a draft is still held).
++    if (hasDraft && (key.check(FcitxKey_space) || key.check(FcitxKey_Return) ||
++                     key.check(FcitxKey_KP_Enter))) {
++        event.filterAndAccept();
++        state->transimeConfirmKey_ = key.sym();
++        if (key.check(FcitxKey_space)) {
++            paragraphInsertLiteral(ic, " ");
++            updateUI(ic);
++        }
++        return true;
++    }
++    // Other control shortcuts never become literal input or an accidental commit.
++    if ((event.rawKey().states() | event.origKey().states()).testAny(KeyStates{
++            KeyState::Ctrl, KeyState::Alt, KeyState::Super, KeyState::Super2,
++            KeyState::Hyper, KeyState::Hyper2, KeyState::Meta, KeyState::Mod5})) return false;
++    if (key.check(FcitxKey_Escape)) {
++        if (!hasDraft && !state->transimeEnglish_) return false;
++        event.filterAndAccept();
++        doReset(ic);
++        return true;
++    }
++    const auto codepoint = Key::keySymToUnicode(key.sym());
++    const bool letter = (codepoint >= 'a' && codepoint <= 'z') || (codepoint >= 'A' && codepoint <= 'Z');
++    const bool digit = codepoint >= '0' && codepoint <= '9';
++    const bool uppercase = codepoint >= 'A' && codepoint <= 'Z';
++    if ((state->transimeEnglish_ || uppercase) && codepoint >= 0x21 && codepoint != 0x7f) {
++        event.filterAndAccept();
++        if (paragraphInsertLiteral(ic, utf8::UCS4ToUTF8(codepoint))) {
++            state->transimeEnglish_ = true;
++        }
++        updateUI(ic);
++        return true;
++    }
++    if (letter) {
++        event.filterAndAccept();
++        if (state->draftBytes() + 4 > 4096 ||
++            (state->literalCursor_ >= 0 && state->segments_.size() >= 32)) {
++            state->transimeAtCapacity_ = true;
++            updateUI(ic); return true;
++        }
++        if (state->literalCursor_ >= 0) {
++            auto &segment = state->segments_[state->activeSegment_];
++            const auto cursor = static_cast<size_t>(state->literalCursor_);
++            PinyinState::Segment next{state->newContext(), segment.literal.substr(cursor)};
++            next.context->appendContextWords(segment.context->selectedWords());
++            segment.literal.resize(cursor);
++            state->segments_.insert(state->segments_.begin() + state->activeSegment_ + 1, std::move(next));
++            ++state->activeSegment_;
++            state->literalCursor_ = -1;
++        }
++        state->transimeAtCapacity_ = false;
++        state->context().type(utf8::UCS4ToUTF8(codepoint));
++        updateUI(ic); return true;
++    }
++    // Every printable symbol is a paragraph literal; native punctuation,
++    // quickphrase and ASCII page shortcuts cannot commit or take over it.
++    if (codepoint >= 0x21 && codepoint != 0x7f && !digit) {
++        event.filterAndAccept();
++        paragraphInsertLiteral(ic, utf8::UCS4ToUTF8(codepoint));
++        updateUI(ic); return true;
++    }
++    std::shared_future<uint32_t> keyChr = std::async(std::launch::deferred, [codepoint] { return codepoint; }).share();
++    ++state->transimeRevision_;
++    if (handleCandidateList(event, keyChr)) return true;
++    if (digit) {
++        event.filterAndAccept();
++        paragraphInsertLiteral(ic, utf8::UCS4ToUTF8(codepoint));
++        updateUI(ic); return true;
++    }
++    if (!hasDraft) return false;
++    if (key.check(FcitxKey_Home) || key.check(FcitxKey_KP_Home)) {
++        paragraphSetCursor(ic, 0);
++    } else if (key.check(FcitxKey_End) || key.check(FcitxKey_KP_End)) {
++        state->activeSegment_ = state->segments_.size() - 1;
++        auto &segment = state->segments_.back();
++        segment.context->setCursor(segment.context->size());
++        state->literalCursor_ = segment.literal.empty() ? -1 : static_cast<int64_t>(segment.literal.size());
++    } else if (key.check(FcitxKey_Left) || key.check(FcitxKey_KP_Left)) {
++        auto &context = state->context();
++        if (state->literalCursor_ > 0) state->literalCursor_ = previousUtf8(state->segments_[state->activeSegment_].literal, state->literalCursor_);
++        else if (state->literalCursor_ == 0) {
++            state->literalCursor_ = -1;
++            context.setCursor(context.size());
++            if (context.cursor()) {
++                if (context.cursor() == context.selectedLength()) context.cancel();
++                context.setCursor(context.cursor() - 1);
++            } else if (state->activeSegment_) {
++                --state->activeSegment_;
++                auto &previous = state->segments_[state->activeSegment_];
++                previous.context->setCursor(previous.context->size());
++                state->literalCursor_ = previous.literal.empty() ? -1 :
++                    static_cast<int64_t>(previousUtf8(previous.literal, previous.literal.size()));
++            }
++        }
++        else if (context.cursor() > 0) {
++            if (context.cursor() == context.selectedLength()) context.cancel();
++            context.setCursor(context.cursor() - 1);
++        } else if (state->activeSegment_) {
++            --state->activeSegment_;
++            auto &previous = state->segments_[state->activeSegment_];
++            previous.context->setCursor(previous.context->size());
++            state->literalCursor_ = previous.literal.empty() ? -1 : static_cast<int64_t>(previous.literal.size());
++        }
++    } else if (key.check(FcitxKey_Right) || key.check(FcitxKey_KP_Right)) {
++        auto &context = state->context();
++        auto &literal = state->segments_[state->activeSegment_].literal;
++        if (state->literalCursor_ >= 0 && static_cast<size_t>(state->literalCursor_) < literal.size()) state->literalCursor_ = nextUtf8(literal, state->literalCursor_);
++        else if (state->literalCursor_ < 0 && context.cursor() < context.size()) context.setCursor(context.cursor() + 1);
++        else if (state->literalCursor_ < 0 && !literal.empty()) state->literalCursor_ = nextUtf8(literal, 0);
++        else if (state->activeSegment_ + 1 < state->segments_.size()) {
++            ++state->activeSegment_; state->literalCursor_ = -1;
++            state->context().setCursor(0);
++        }
++    } else if (key.check(FcitxKey_BackSpace)) {
++        // Cross a literal boundary and operate on the original previous native
++        // context. Empty segment shells are removed without rebuilding text.
++        while (state->literalCursor_ <= 0 && state->context().empty() && state->activeSegment_) {
++            const auto index = state->activeSegment_;
++            if (state->segments_[index].literal.empty()) state->segments_.erase(state->segments_.begin() + index);
++            --state->activeSegment_;
++            auto &previous = state->segments_[state->activeSegment_];
++            previous.context->setCursor(previous.context->size());
++            state->literalCursor_ = previous.literal.empty() ? -1 : static_cast<int64_t>(previous.literal.size());
++        }
++        auto &context = state->context();
++        auto &literal = state->segments_[state->activeSegment_].literal;
++        if (state->literalCursor_ > 0) {
++            const size_t end = state->literalCursor_;
++            const size_t begin = previousUtf8(literal, end);
++            literal.erase(begin, end - begin);
++            state->literalCursor_ = begin;
++        } else {
++            state->literalCursor_ = -1;
++            if (context.cursor() == 0 && state->activeSegment_) {
++                --state->activeSegment_;
++                auto &previous = state->segments_[state->activeSegment_];
++                previous.context->setCursor(previous.context->size());
++                state->literalCursor_ = previous.literal.size();
++                if (!previous.literal.empty()) {
++                    const auto begin = previousUtf8(previous.literal, previous.literal.size());
++                    previous.literal.resize(begin); state->literalCursor_ = begin;
++                } else if (previous.context->selectedLength() && *config_.useBackSpaceToUnselect) previous.context->cancel();
++                else previous.context->backspace();
++            } else if (context.selectedLength() && *config_.useBackSpaceToUnselect) context.cancel();
++            else context.backspace();
++        }
++    } else if (key.check(FcitxKey_Delete) || key.check(FcitxKey_KP_Delete)) {
++        auto &context = state->context();
++        auto &literal = state->segments_[state->activeSegment_].literal;
++        if (state->literalCursor_ < 0 && context.cursor() < context.size()) context.del();
++        else {
++            if (state->literalCursor_ < 0) state->literalCursor_ = 0;
++            const size_t begin = state->literalCursor_;
++            if (begin < literal.size()) literal.erase(begin, nextUtf8(literal, begin) - begin);
++            else if (state->activeSegment_ + 1 < state->segments_.size()) {
++                ++state->activeSegment_; state->literalCursor_ = -1;
++                state->context().setCursor(0); state->context().del();
++            }
++        }
++    } else {
++        return false;
++    }
++    state->transimeAtCapacity_ = false;
++    event.filterAndAccept();
++    updateUI(ic); return true;
+ }
+ 
+ std::string PinyinEngine::evaluateCustomPhrase(InputContext *inputContext,
+@@ -811,9 +1780,24 @@
+             if (!entry || entry->addon() != "pinyin") {
+                 return;
+             }
++            if (entry->uniqueName() == "pinyin" && handleParagraphModeKey(keyEvent)) {
++                return;
++            }
+             handle2nd3rdSelection(keyEvent);
+         });
+ 
++    transimeCapabilityEvent_ = instance_->watchEvent(
++        EventType::InputContextCapabilityChanged, EventWatcherPhase::PreInputMethod,
++        [this](Event &event) {
++            auto *ic = static_cast<InputContextEvent &>(event).inputContext();
++            auto *state = ic->propertyFor(&factory_);
++            if (state->transimeHold_ &&
++                ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
++                state->transimeHold_ = false;
++                state->transimeDisablePending_ = false;
++                doReset(ic);
++            }
++        });
+     pyConfig_.shuangpinProfile.annotation().setHidden(true);
+     pyConfig_.showShuangpinMode.annotation().setHidden(true);
+     pyConfig_.fuzzyConfig->partialSp.annotation().setHidden(true);
+@@ -1149,14 +2133,40 @@
+     inputContext->statusArea().addAction(StatusGroup::InputMethod,
+                                          &predictionAction_);
+     auto *state = inputContext->propertyFor(&factory_);
+-    state->context_.setUseShuangpin(entry.uniqueName() == "shuangpin");
++    state->clearParagraphShift();
++    ++state->transimeRevision_;
++    // Pinyin and shuangpin share this property factory. Park a held paragraph
++    // before entering shuangpin, so another input-method entry cannot edit it.
++    state->transimeSuspended_ = entry.uniqueName() != "pinyin";
++    state->context().setUseShuangpin(entry.uniqueName() == "shuangpin");
+     // TODO: use surrouding to re-build context.
+-    state->context_.clearContextWords();
++    state->context().clearContextWords();
++    if (state->paragraphActive()) {
++        if (inputContext->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
++            doReset(inputContext);
++        } else {
++            updateUI(inputContext);
++        }
++    }
+ }
+ 
+ void PinyinEngine::deactivate(const fcitx::InputMethodEntry &entry,
+                               fcitx::InputContextEvent &event) {
+     auto *inputContext = event.inputContext();
++    auto *paragraphState = inputContext->propertyFor(&factory_);
++    paragraphState->clearParagraphShift();
++    if (!paragraphState->hasDraft()) paragraphState->transimeEnglish_ = false;
++    if (paragraphState->paragraphActive()) {
++        ++paragraphState->transimeRevision_;
++        if (inputContext->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
++            doReset(inputContext);
++        } else {
++            inputContext->inputPanel().reset();
++            inputContext->updatePreedit();
++            inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
++        }
++        return;
++    }
+     do {
+         if (event.type() != EventType::InputContextSwitchInputMethod) {
+             break;
+@@ -1174,7 +2184,7 @@
+             break;
+         }
+ 
+-        if (state->context_.empty()) {
++        if (state->context().empty()) {
+             break;
+         }
+ 
+@@ -1183,13 +2193,20 @@
+             inputContext->commitString(preeditCommitString(inputContext));
+             break;
+         case SwitchInputMethodBehavior::CommitDefault: {
+-            inputContext->commitString(state->context_.sentence());
++            inputContext->commitString(state->context().sentence());
+             break;
+         }
+         case SwitchInputMethodBehavior::Clear:
+             break;
+         }
+     } while (0);
++    if (paragraphState->transimeHold_ && paragraphState->transimeSuspended_) {
++        paragraphState->standaloneContext_->clear();
++        inputContext->inputPanel().reset();
++        inputContext->updatePreedit();
++        inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
++        return;
++    }
+     reset(entry, event);
+ }
+ 
+@@ -1522,10 +2539,10 @@
+         if (const auto *pyCandidate =
+                 dynamic_cast<const PinyinCandidateWord *>(&candidate)) {
+             if (pyCandidate->idx_ >=
+-                    state->context_.candidatesToCursor().size() ||
+-                state->context_
++                    state->context().candidatesToCursor().size() ||
++                state->context()
+                     .candidateFullPinyin(
+-                        state->context_.candidatesToCursor()[pyCandidate->idx_])
++                        state->context().candidatesToCursor()[pyCandidate->idx_])
+                     .empty()) {
+                 continue;
+             }
+@@ -1563,24 +2580,24 @@
+ void PinyinEngine::forgetCandidate(InputContext *inputContext, size_t index) {
+     auto *state = inputContext->propertyFor(&factory_);
+ 
+-    const std::string currentInput = state->context_.userInput();
+-
+-    if (index < state->context_.candidatesToCursor().size()) {
+-        const auto &sentence = state->context_.candidatesToCursor()[index];
++    const std::string currentInput = state->context().userInput();
++
++    if (index < state->context().candidatesToCursor().size()) {
++        const auto &sentence = state->context().candidatesToCursor()[index];
+         // If this is a word, remove it from user dict.
+         if (sentence.size() == 1) {
+-            auto py = state->context_.candidateFullPinyin(index);
+-            state->context_.ime()->dict()->removeWord(
++            auto py = state->context().candidateFullPinyin(index);
++            state->context().ime()->dict()->removeWord(
+                 libime::PinyinDictionary::UserDict, py, sentence.toString());
+         }
+         for (const auto &word : sentence.sentence()) {
+-            state->context_.ime()->model()->history().forget(word->word());
++            state->context().ime()->model()->history().forget(word->word());
+         }
+     }
+     resetForgetCandidate(inputContext);
+     doReset(inputContext);
+ 
+-    state->context_.type(currentInput);
++    state->context().type(currentInput);
+     updateUI(inputContext);
+ }
+ 
+@@ -1605,7 +2622,7 @@
+ void PinyinEngine::pinCustomPhrase(InputContext *inputContext,
+                                    const std::string &customPhrase) {
+     auto *state = inputContext->propertyFor(&factory_);
+-    auto &context = state->context_;
++    auto &context = state->context();
+     // Precompute some values.
+     const auto selectedLength = context.selectedLength();
+     const auto pyLength = context.cursor() > selectedLength
+@@ -1622,7 +2639,7 @@
+ void PinyinEngine::deleteCustomPhrase(InputContext *inputContext,
+                                       const std::string &customPhrase) {
+     auto *state = inputContext->propertyFor(&factory_);
+-    auto &context = state->context_;
++    auto &context = state->context();
+     // Precompute some values.
+     const auto selectedLength = context.selectedLength();
+     const auto pyLength = context.cursor() > selectedLength
+@@ -1793,13 +2810,13 @@
+     // until "ni", instead of "n". which means you are not inserting "," between
+     // n & i. Thus, let's just make it select the default candidate.
+     // Also, it can not work with punctuation candidate, or type punc in pair.
+-    if (!state->context_.empty()) {
++    if (!state->context().empty()) {
+         event.filterAndAccept();
+         return true;
+     }
+     // It's a key not handled by engine, just clear the word context.
+     // Need to do after candidate selection, so the context is properly reset.
+-    state->context_.clearContextWords();
++    state->context().clearContextWords();
+ 
+     std::string punc;
+     std::string puncAfter;
+@@ -1929,6 +2946,16 @@
+             return utf8::UCS4ToUTF8(keyChr.get());
+         }).share();
+ 
++    if (state->transimeConfirmKey_ == event.key().sym()) {
++        event.filterAndAccept();
++        if (event.isRelease()) state->transimeConfirmKey_ = FcitxKey_None;
++        return;
++    }
++    if (state->paragraphActive()) {
++        handleParagraphKey(event);
++        return;
++    }
++
+     // 2nd/3rd selection is allowed to be modifier only, handle them before we
+     // skip the release.
+     if (handle2nd3rdSelection(event)) {
+@@ -1948,6 +2975,11 @@
+     if (event.key().isModifier()) {
+         return;
+     }
++
++    // Includes highlight/page keys that do not rebuild updateUI. Releases and
++    // pure modifiers preserve readiness; actual modifier-release selection uses
++    // candidate.select() -> updateUI(), which advances the revision separately.
++    ++state->transimeRevision_;
+ 
+     if (handleCloudpinyinTrigger(event)) {
+         return;
+@@ -1995,30 +3027,30 @@
+ 
+     auto checkSp = [this, &keyChr](const KeyEvent &event, PinyinState *state) {
+         auto shuangpinProfile = ime_->shuangpinProfile();
+-        if (!state->context_.useShuangpin() || !shuangpinProfile ||
++        if (!state->context().useShuangpin() || !shuangpinProfile ||
+             !event.key().isSimple()) {
+             return false;
+         }
+         // event.key().isSimple() make sure the return value is within range of
+         // char.
+         char chr = keyChr.get();
+-        return (!state->context_.empty() &&
++        return (!state->context().empty() &&
+                 shuangpinProfile->validInput().contains(chr)) ||
+-               (state->context_.empty() &&
++               (state->context().empty() &&
+                 shuangpinProfile->validInitial().contains(chr));
+     };
+ 
+     if (!event.key().hasModifier() && quickphrase() &&
+         !quickphraseTriggerRegex_.empty() && !keyStr.get().empty() &&
+-        state->context_.selectedLength() == 0 &&
+-        state->context_.cursor() == state->context_.size()) {
++        state->context().selectedLength() == 0 &&
++        state->context().cursor() == state->context().size()) {
+         std::string text =
+-            stringutils::concat(state->context_.userInput(), keyStr.get());
++            stringutils::concat(state->context().userInput(), keyStr.get());
+         for (const auto &reg : quickphraseTriggerRegex_) {
+             if (std::regex_search(text, reg,
+                                   std::regex_constants::match_default)) {
+                 // Keep the current state before reset.
+-                const std::string origin = state->context_.userInput();
++                const std::string origin = state->context().userInput();
+                 doReset(inputContext);
+                 quickphrase()->call<IQuickPhrase::trigger>(inputContext, "", "",
+                                                            "", "", Key());
+@@ -2028,7 +3060,7 @@
+                         if (this->instance()->inputMethodEngine(ic) == this) {
+                             auto *state = ic->propertyFor(&factory_);
+                             doReset(ic);
+-                            state->context_.type(origin);
++                            state->context().type(origin);
+                             updateUI(ic);
+                         }
+                     });
+@@ -2039,12 +3071,12 @@
+     }
+ 
+     if (event.key().isLAZ() || event.key().isUAZ() ||
+-        (event.key().check(FcitxKey_apostrophe) && !state->context_.empty()) ||
++        (event.key().check(FcitxKey_apostrophe) && !state->context().empty()) ||
+         checkSp(event, state)) {
+         // first v, use it to trigger quickphrase
+         if (*config_.useVAsQuickphrase && quickphrase() &&
+-            state->context_.empty()) {
+-            const bool isSp = state->context_.useShuangpin();
++            state->context().empty()) {
++            const bool isSp = state->context().useShuangpin();
+             if ((event.key().check(FcitxKey_v) && !isSp) ||
+                 (event.key().check(FcitxKey_V) && isSp)) {
+                 const std::string leadingString =
+@@ -2058,90 +3090,90 @@
+             }
+         }
+         event.filterAndAccept();
+-        if (!state->context_.type(keyStr.get())) {
++        if (!state->context().type(keyStr.get())) {
+             return;
+         }
+-    } else if (!state->context_.empty()) {
++    } else if (!state->context().empty()) {
+         // key to handle when it is not empty.
+         if (event.key().check(FcitxKey_BackSpace)) {
+             if (*config_.useBackSpaceToUnselect &&
+-                state->context_.selectedLength()) {
+-                state->context_.cancel();
++                state->context().selectedLength()) {
++                state->context().cancel();
+             } else {
+-                state->context_.backspace();
++                state->context().backspace();
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Delete) ||
+                    event.key().check(FcitxKey_KP_Delete)) {
+-            state->context_.del();
++            state->context().del();
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_BackSpace, KeyState::Ctrl)) {
+-            if (state->context_.cursor() == state->context_.selectedLength()) {
+-                state->context_.cancel();
+-            }
+-            auto cursor = state->context_.pinyinBeforeCursor();
++            if (state->context().cursor() == state->context().selectedLength()) {
++                state->context().cancel();
++            }
++            auto cursor = state->context().pinyinBeforeCursor();
+             if (cursor >= 0) {
+-                state->context_.erase(cursor, state->context_.cursor());
++                state->context().erase(cursor, state->context().cursor());
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Delete, KeyState::Ctrl) ||
+                    event.key().check(FcitxKey_KP_Delete, KeyState::Ctrl)) {
+-            auto cursor = state->context_.pinyinAfterCursor();
++            auto cursor = state->context().pinyinAfterCursor();
+             if (cursor >= 0 &&
+-                static_cast<size_t>(cursor) <= state->context_.size()) {
+-                state->context_.erase(state->context_.cursor(), cursor);
++                static_cast<size_t>(cursor) <= state->context().size()) {
++                state->context().erase(state->context().cursor(), cursor);
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Home) ||
+                    event.key().check(FcitxKey_KP_Home)) {
+-            state->context_.setCursor(state->context_.selectedLength());
++            state->context().setCursor(state->context().selectedLength());
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_End) ||
+                    event.key().check(FcitxKey_KP_End)) {
+-            state->context_.setCursor(state->context_.size());
++            state->context().setCursor(state->context().size());
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Left) ||
+                    event.key().check(FcitxKey_KP_Left)) {
+-            if (state->context_.cursor() == state->context_.selectedLength()) {
+-                state->context_.cancel();
+-            }
+-            auto cursor = state->context_.cursor();
++            if (state->context().cursor() == state->context().selectedLength()) {
++                state->context().cancel();
++            }
++            auto cursor = state->context().cursor();
+             if (cursor > 0) {
+-                state->context_.setCursor(cursor - 1);
++                state->context().setCursor(cursor - 1);
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Right) ||
+                    event.key().check(FcitxKey_KP_Right)) {
+-            auto cursor = state->context_.cursor();
+-            if (cursor < state->context_.size()) {
+-                state->context_.setCursor(cursor + 1);
++            auto cursor = state->context().cursor();
++            if (cursor < state->context().size()) {
++                state->context().setCursor(cursor + 1);
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Left, KeyState::Ctrl) ||
+                    event.key().check(FcitxKey_KP_Left, KeyState::Ctrl)) {
+-            if (state->context_.cursor() == state->context_.selectedLength()) {
+-                state->context_.cancel();
+-            }
+-            auto cursor = state->context_.pinyinBeforeCursor();
++            if (state->context().cursor() == state->context().selectedLength()) {
++                state->context().cancel();
++            }
++            auto cursor = state->context().pinyinBeforeCursor();
+             if (cursor >= 0) {
+-                state->context_.setCursor(cursor);
++                state->context().setCursor(cursor);
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Right, KeyState::Ctrl) ||
+                    event.key().check(FcitxKey_KP_Right, KeyState::Ctrl)) {
+-            auto cursor = state->context_.pinyinAfterCursor();
++            auto cursor = state->context().pinyinAfterCursor();
+             if (cursor >= 0 &&
+-                static_cast<size_t>(cursor) <= state->context_.size()) {
+-                state->context_.setCursor(cursor);
++                static_cast<size_t>(cursor) <= state->context().size()) {
++                state->context().setCursor(cursor);
+             }
+             event.filterAndAccept();
+         } else if (event.key().check(FcitxKey_Escape)) {
+-            state->context_.clear();
++            state->context().clear();
+             event.filterAndAccept();
+         } else if (event.key().checkKeyList(*config_.commitRawInput)) {
+             inputContext->commitString(preeditCommitString(inputContext));
+-            state->context_.clear();
+-            state->context_.clearContextWords();
++            state->context().clear();
++            state->context().clearContextWords();
+             event.filterAndAccept();
+         } else if (int idx =
+                        event.key().keyListIndex(*config_.selectCharFromPhrase);
+@@ -2159,13 +3191,13 @@
+                     const std::string_view chr =
+                         std::next(utf8::MakeUTF8CharRange(str).begin(), idx)
+                             .view();
+-                    auto segmentLength = state->context_.size() -
+-                                         state->context_.selectedLength();
++                    auto segmentLength = state->context().size() -
++                                         state->context().selectedLength();
+                     const auto *pyCandidate =
+                         dynamic_cast<const PinyinCandidateWord *>(&candidate);
+                     if (pyCandidate) {
+                         const auto &contextCandidates =
+-                            state->context_.candidatesToCursor();
++                            state->context().candidatesToCursor();
+                         if (pyCandidate->idx_ < contextCandidates.size()) {
+                             const auto &sentence =
+                                 contextCandidates[pyCandidate->idx_].sentence();
+@@ -2175,7 +3207,7 @@
+                                 std::min(segmentLength, candidateSegmentLength);
+                         }
+                     }
+-                    state->context_.selectCustom(segmentLength, chr);
++                    state->context().selectCustom(segmentLength, chr);
+                     event.filterAndAccept();
+                 }
+             }
+@@ -2235,11 +3267,13 @@
+ 
+ void PinyinEngine::doReset(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&factory_);
++    ++state->transimeRevision_;
+     resetStroke(inputContext);
+     resetForgetCandidate(inputContext);
+     state->mode_ = PinyinMode::Normal;
+-    state->context_.clear();
+-    state->context_.clearContextWords();
++    state->clearParagraph();
++    state->standaloneContext_->clear();
++    state->transimeConfirmKey_ = FcitxKey_None;
+     state->predictWords_.reset();
+     inputContext->inputPanel().reset();
+     inputContext->updatePreedit();
+@@ -2307,8 +3341,17 @@
+                                     InvokeActionEvent &event) {
+     auto *inputContext = event.inputContext();
+     auto *state = inputContext->propertyFor(&factory_);
+-    auto &context = state->context_;
++    auto &context = state->context();
+     auto &inputPanel = inputContext->inputPanel();
++    if (state->paragraphActive()) {
++        if (event.action() == InvokeActionEvent::Action::LeftClick && event.cursor() >= 0 &&
++            static_cast<size_t>(event.cursor()) <= utf8::length(inputPanel.preedit().toString())) {
++            event.filter();
++            paragraphSetCursor(inputContext, event.cursor());
++            updateUI(inputContext);
++        }
++        return;
++    }
+     if (event.cursor() < 0 ||
+         event.action() != InvokeActionEvent::Action::LeftClick ||
+         !inputContext->capabilityFlags().test(CapabilityFlag::Preedit)) {
+@@ -2353,7 +3396,7 @@
+                 if (utf8::length(preeditText.begin(),
+                                  preeditText.begin() + preeditCursor) <
+                     cursor) {
+-                    state->context_.setCursor(context.cursor() + 1);
++                    state->context().setCursor(context.cursor() + 1);
+                 } else {
+                     break;
+                 }
+@@ -2361,7 +3404,7 @@
+             auto [preeditText, preeditCursor] = context.preeditWithCursor();
+             if (utf8::length(preeditText.begin(),
+                              preeditText.begin() + preeditCursor) > cursor) {
+-                state->context_.setCursor(context.cursor() - 1);
++                state->context().setCursor(context.cursor() - 1);
+             }
+         }
+         break;
+@@ -2380,9 +3423,20 @@
+                                        const std::string &selected,
+                                        const std::string &word) {
+     auto *state = inputContext->propertyFor(&factory_);
+-    auto words = state->context_.selectedWords();
++    if (state->paragraphActive()) {
++        auto &context = state->context();
++        // A cloud choice is still only a Chinese selection. Never run native
++        // cloud learning/commit before the explicit paragraph confirmation.
++        if (selected == context.selectedSentence() && context.selectedLength() < context.size() &&
++            transimeCommentIsSafe(word) && state->draftBytes() + word.size() <= 4096) {
++            context.selectCustom(context.size() - context.selectedLength(), word);
++            updateUI(inputContext);
++        }
++        return;
++    }
++    auto words = state->context().selectedWords();
+     // This ensure us to convert pinyin to the right one.
+-    auto preedit = state->context_.preedit(libime::PinyinPreeditMode::RawText);
++    auto preedit = state->context().preedit(libime::PinyinPreeditMode::RawText);
+     // preedit is "selected sentence" + Pinyin.
+     do {
+         // Validate selected is still the same.
+@@ -2398,7 +3452,7 @@
+         if (pinyins.empty() || pinyins.size() != utf8::length(word)) {
+             break;
+         }
+-        const auto &candidates = state->context_.candidates();
++        const auto &candidates = state->context().candidates();
+         auto pinyinsIter = pinyins.begin();
+         auto pinyinsEnd = pinyins.end();
+         if (!candidates.empty()) {
+@@ -2436,14 +3490,14 @@
+                             [](const std::string &w) {
+                                 return utf8::length(w) == 1;
+                             })) {
+-                words = state->context_.selectedWords();
++                words = state->context().selectedWords();
+                 auto joined =
+                     stringutils::join(pinyins.begin(), pinyins.end(), "'");
+                 words.push_back(word);
+                 ime_->dict()->addWord(libime::PinyinDictionary::UserDict,
+                                       joined, word);
+             } else {
+-                if (state->context_.useShuangpin()) {
++                if (state->context().useShuangpin()) {
+                     bool end = false;
+                     for (auto &sppinyin :
+                          MakeIterRange(pinyinsIter, pinyinsEnd)) {
+@@ -2475,11 +3529,11 @@
+             PINYIN_DEBUG() << "Failed to save cloudpinyin: " << e.what();
+         }
+     } while (0);
+-    state->context_.clear();
++    state->context().clear();
+     inputContext->commitString(selected + word);
+     inputContext->inputPanel().reset();
+     if (*config_.keepCurrentContext) {
+-        state->context_.appendContextWords(words);
++        state->context().appendContextWords(words);
+     }
+     if (*config_.predictionEnabled) {
+         state->predictWords_ = std::move(words);
+diff --git a/im/pinyin/pinyin.h b/im/pinyin/pinyin.h
+--- a/im/pinyin/pinyin.h
++++ b/im/pinyin/pinyin.h
+@@ -8,6 +8,7 @@
+ #define _PINYIN_PINYIN_H_
+ 
+ #include "customphrase.h"
++#include "pinyin_public.h"
+ #include "symboldictionary.h"
+ #include "workerthread.h"
+ #include <cstddef>
+@@ -352,6 +353,7 @@
+ struct EventSourceTime;
+ class CandidateList;
+ class PinyinEngine;
++struct PinyinTransimeCommentHandle;
+ 
+ enum class PinyinMode { Normal, StrokeFilter, ForgetCandidate, Punctuation };
+ 
+@@ -359,7 +361,48 @@
+ public:
+     PinyinState(PinyinEngine *engine);
+ 
+-    libime::PinyinContext context_;
++    struct Segment {
++        std::unique_ptr<libime::PinyinContext> context;
++        std::string literal;
++    };
++    PinyinEngine *engine_;
++    std::vector<Segment> segments_;
++    size_t activeSegment_ = 0;
++    // -1: native pinyin cursor; otherwise UTF-8 boundary within literal.
++    int64_t literalCursor_ = -1;
++    bool transimeHold_ = false;
++    bool transimeSuspended_ = false;
++    std::unique_ptr<libime::PinyinContext> standaloneContext_;
++    bool paragraphActive() const { return transimeHold_ && !transimeSuspended_; }
++    bool transimeDisablePending_ = false;
++    uint64_t transimeDraftId_ = 0;
++    uint64_t transimeCandidateEpoch_ = 0;
++    KeySym transimeConfirmKey_ = FcitxKey_None;
++    bool transimeAtCapacity_ = false;
++    PinyinTransimeControlsV1 transimeControls_;
++    bool transimeSelecting_ = false;
++    // Temporary literal mode is owned by this IC/draft, never global IM state.
++    bool transimeEnglish_ = false;
++    KeySym transimeShiftTap_ = FcitxKey_None;
++    uint64_t transimeShiftTapTime_ = 0;
++    uint8_t transimeShiftDown_ = 0;
++    bool transimeModeSpaceDown_ = false;
++    void clearParagraphShift() {
++        transimeShiftTap_ = FcitxKey_None;
++        transimeShiftTapTime_ = 0;
++        transimeShiftDown_ = 0;
++        transimeModeSpaceDown_ = false;
++    }
++    libime::PinyinContext &context() { return transimeSuspended_ ? *standaloneContext_ : *segments_[activeSegment_].context; }
++    const libime::PinyinContext &context() const { return transimeSuspended_ ? *standaloneContext_ : *segments_[activeSegment_].context; }
++    std::unique_ptr<libime::PinyinContext> newContext() const;
++    bool hasDraft() const;
++    size_t draftBytes() const;
++    void clearParagraph();
++    // Conservative bridge generation; read-only snapshots never increment it.
++    uint64_t transimeRevision_ = 0;
++    // Bounded weak handles to at most ten annotations, including cached pages.
++    std::vector<std::weak_ptr<PinyinTransimeCommentHandle>> transimeComments_;
+     bool lastIsPunc_ = false;
+ 
+     PinyinMode mode_ = PinyinMode::Normal;
+@@ -397,6 +440,7 @@
+     void doReset(InputContext *inputContext) const;
+     void save() override;
+     auto &factory() { return factory_; }
++    const auto &factory() const { return factory_; }
+     std::string subMode(const InputMethodEntry &entry,
+                         InputContext &inputContext) override;
+     void invokeActionImpl(const InputMethodEntry &entry,
+@@ -422,6 +466,31 @@
+     void updatePredict(InputContext *inputContext);
+ 
+     void updateUI(InputContext *inputContext);
++
++    PinyinTransimeSnapshotV1 transimeSnapshotV1(InputContext *inputContext) const;
++    PinyinTransimeSnapshotV1 transimeSnapshotAtV1(InputContext *inputContext,
++                                                int pageIndex) const;
++    bool transimeSetCommentV1(InputContext *inputContext, int pageIndex,
++                              PinyinTransimeSnapshotV1 expected,
++                              std::string translation) const;
++    int transimeSetHoldV1(InputContext *, bool);
++    bool transimeSetControlsV1(InputContext *, PinyinTransimeControlsV1);
++    PinyinTransimeParagraphSnapshotV2 transimeParagraphSnapshotV2(InputContext *, int) const;
++    bool transimeCommitParagraphV2(InputContext *, PinyinTransimeParagraphSnapshotV2,
++                                   PinyinTransimeCommitModeV2, std::string);
++    bool transimeSetParagraphCommentV2(InputContext *, int,
++                                      PinyinTransimeParagraphSnapshotV2, std::string) const;
++    bool transimeCancelParagraphV1(InputContext *, uint64_t);
++    using Pinyin = PinyinEngine; // Keep the public addon function name IPinyin.
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeSnapshotV1);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeSnapshotAtV1);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeSetCommentV1);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeSetHoldV1);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeSetControlsV1);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeParagraphSnapshotV2);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeCommitParagraphV2);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeSetParagraphCommentV2);
++    FCITX_ADDON_EXPORT_FUNCTION(Pinyin, transimeCancelParagraphV1);
+ 
+     void resetStroke(InputContext *inputContext) const;
+     void resetForgetCandidate(InputContext *inputContext) const;
+@@ -436,6 +505,14 @@
+     const auto &selectionKeys() const { return selectionKeys_; }
+ 
+ private:
++    PinyinTransimeSnapshotV1 transimeSnapshotAtImpl(InputContext *, int, bool) const;
++    bool handleParagraphKey(KeyEvent &);
++    bool handleParagraphModeKey(KeyEvent &);
++    void updateParagraphModeUI(InputContext *) const;
++    void toggleParagraphMode(InputContext *) const;
++    void paragraphSetCursor(InputContext *, size_t);
++    bool paragraphInsertLiteral(InputContext *, const std::string &);
++    bool paragraphSelectCurrent(InputContext *);
+     void cloudPinyinSelected(InputContext *inputContext,
+                              const std::string &selected,
+                              const std::string &word);
+@@ -496,6 +573,7 @@
+     std::unique_ptr<EventSource> deferEvent_;
+     std::unique_ptr<EventSource> deferredPreload_;
+     std::unique_ptr<HandlerTableEntry<EventHandler>> event_;
++    std::unique_ptr<HandlerTableEntry<EventHandler>> transimeCapabilityEvent_;
+     CustomPhraseDict customPhrase_;
+     SymbolDict symbols_;
+     WorkerThread worker_;
+diff --git a/im/pinyin/pinyin_public.h b/im/pinyin/pinyin_public.h
+new file mode 100644
+--- /dev/null
++++ b/im/pinyin/pinyin_public.h
+@@ -0,0 +1,157 @@
++/*
++ * SPDX-FileCopyrightText: 2026 TransIME contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#ifndef _PINYIN_TRANSIME_PUBLIC_H_
++#define _PINYIN_TRANSIME_PUBLIC_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <fcitx/addoninstance.h>
++#include <fcitx-utils/key.h>
++#include <string>
++
++namespace fcitx {
++class InputContext;
++
++// Experimental extension to chinese-addons 5.1.12, NOT an upstream API.
++// All strings are owned copies. Call only on Fcitx's event thread with a live IC.
++struct PinyinTransimeSnapshotV1 {
++    std::uint32_t apiVersion = 1;
++    bool ready = false;
++    std::string reason = "inactive";
++    // Per-IC conservative input/UI generation, never advanced by this read.
++    // This is not an IC identity; callers must also track IC lifetime/focus.
++    std::uint64_t revision = 0;
++    std::string selectedText;
++    std::string candidateText;
++    std::string source;
++    // Offsets are bytes in ASCII pinyin input, not offsets into Chinese text.
++    std::size_t inputBytes = 0;
++    std::size_t selectedInputBytes = 0;
++    std::size_t candidateInputEnd = 0;
++    std::size_t cursorBytes = 0;
++    // The libime candidate index; not the on-screen page-relative position.
++    int candidateIndex = -1;
++};
++
++// Paragraph extension. V1 readers deliberately refuse an IC in hold mode.
++// All offsets below refer to UTF-8 bytes in the rendered paragraph preedit;
++// activeCandidate keeps its separate, segment-local ASCII input offsets.
++struct PinyinTransimeParagraphSnapshotV2 {
++    std::uint32_t apiVersion = 2;
++    bool hold = false;
++    bool hasDraft = false;
++    bool ready = false; // Entire source is resolved Chinese/literal text.
++    bool fullySelected = false;
++    std::string reason = "inactive";
++    std::uint64_t draftId = 0;
++    std::uint64_t revision = 0;
++    std::size_t activeSegment = 0;
++    std::size_t cursorBytes = 0;
++    // -1 means there is no ordinary pending candidate (e.g. fully selected).
++    int pageIndex = -1;
++    std::string source;
++    std::string rawInput; // Original pinyin of all segments plus literal marks.
++    PinyinTransimeSnapshotV1 activeCandidate;
++};
++
++enum class PinyinTransimeCommitModeV2 { Chinese = 0, Raw = 1, Translation = 2 };
++
++// Optional extension: old V1/V2 consumers retain the historical shortcuts.
++struct PinyinTransimeControlsV1 {
++    bool showModeHints = false;
++    KeyList chineseCommit{Key("space")};
++    KeyList rawCommit{Key("Return"), Key("KP_Enter")};
++    KeyList literalSpace{Key("Shift+space")};
++};
++
++// Shared validation for settings supplied over the addon boundary. Bare text,
++// editing/navigation keys and modifier taps belong to composition. Ctrl+Space
++// remains the paragraph's language switch. Detect normalized duplicates too.
++inline bool transimeValidControlKeys(const std::vector<KeyList> &groups) {
++    KeyList seen;
++    for (const auto &group : groups) {
++        for (const auto &original : group) {
++            if (original.states() & ~KeyStates{KeyState::Ctrl, KeyState::Alt,
++                    KeyState::Shift, KeyState::Super, KeyState::Super2}) return false;
++            const auto key = original.normalize();
++            if (!key.isValid() || key.isModifier() || key.code() ||
++                key.check(FcitxKey_space, KeyState::Ctrl)) return false;
++            const bool command = key.states().testAny(KeyStates{
++                KeyState::Ctrl, KeyState::Alt, KeyState::Super});
++            const auto sym = key.sym();
++            if (!command && sym != FcitxKey_space && sym != FcitxKey_Return &&
++                sym != FcitxKey_KP_Enter && !(sym >= FcitxKey_F1 && sym <= FcitxKey_F35)) return false;
++            if (key.checkKeyList(seen)) return false;
++            seen.push_back(key);
++        }
++    }
++    return true;
++}
++
++inline KeyList transimeNormalizeControlKeys(KeyList keys) {
++    for (auto &key : keys) key = key.normalize();
++    return keys;
++}
++} // namespace fcitx
++
++// Returns false without changing controls if required keys are empty/invalid.
++// This changes no draft, input mode or persisted user configuration.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeSetControlsV1,
++                            bool(fcitx::InputContext *, fcitx::PinyinTransimeControlsV1));
++
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeSnapshotV1,
++                            fcitx::PinyinTransimeSnapshotV1(fcitx::InputContext *));
++
++// Read an ordinary complete candidate at this zero-based position on the
++// CURRENT page. This does not move the cursor or materialize other pages.
++// snapshot.candidateIndex remains the libime index, not this page position.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeSnapshotAtV1,
++                            fcitx::PinyinTransimeSnapshotV1(fcitx::InputContext *, int));
++
++// A nonempty comment is accepted only when expected exactly matches the live
++// eligible candidate snapshot. UTF-8, <=4096 bytes, no C0/C1 controls, line/para
++// separators or bidi/zero-width controls. Callers still validate translation
++// policy/semantics before displaying it. Only comment changes: no learning,
++// text/select/forget/cursor/layout/revision changes and no UI event is emitted.
++// Empty text restores the annotated candidate object's saved original Text,
++// including formatting, only if expected and the original page position match
++// its last annotation. Restore may follow focus/sensitivity or page changes; it
++// never writes new text or changes the current page/cursor. The engine keeps at
++// most 10 weak annotation handles; it never scans/materializes other pages.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeSetCommentV1,
++                            bool(fcitx::InputContext *, int,
++                                 fcitx::PinyinTransimeSnapshotV1, std::string));
++
++// 0=disabled, 1=enabled, 2=disable deferred until this draft is explicitly
++// committed/cancelled, 3=rejected. No implicit commit, reset or user-config write.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeSetHoldV1,
++                            int(fcitx::InputContext *, bool));
++
++// pageIndex=-1 reads the real highlighted row, or the fully selected paragraph.
++// A nonnegative index reads that ordinary row on the current page. Reads never
++// select, learn, move the cursor, or increment either generation.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeParagraphSnapshotV2,
++                            fcitx::PinyinTransimeParagraphSnapshotV2(fcitx::InputContext *, int));
++
++// Explicit confirmation only. Revalidates expected against this IC and draft.
++// Raw may commit unresolved pinyin; Translation requires ready and safe UTF-8.
++// Chinese learns native pinyin segments; Translation does not learn English.
++// False retains the draft unless a separate explicit reset/destroy cancelled it.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeCommitParagraphV2,
++                            bool(fcitx::InputContext *,
++                                 fcitx::PinyinTransimeParagraphSnapshotV2,
++                                 fcitx::PinyinTransimeCommitModeV2, std::string));
++
++// Only current ordinary candidate annotations. Empty text restores the saved
++// object (also after paging/focus); never changes input, revision or emits UI.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeSetParagraphCommentV2,
++                            bool(fcitx::InputContext *, int,
++                                 fcitx::PinyinTransimeParagraphSnapshotV2, std::string));
++
++// Explicit cancellation bound to a draft. Focus loss must not call this API.
++FCITX_ADDON_DECLARE_FUNCTION(Pinyin, transimeCancelParagraphV1,
++                            bool(fcitx::InputContext *, std::uint64_t));
++
++#endif // _PINYIN_TRANSIME_PUBLIC_H_
+diff --git a/im/pinyin/pinyincandidate.cpp b/im/pinyin/pinyincandidate.cpp
+--- a/im/pinyin/pinyincandidate.cpp
++++ b/im/pinyin/pinyincandidate.cpp
+@@ -35,6 +35,7 @@
+     : CandidateWord(Text(word)), engine_(engine), word_(std::move(word)) {}
+ 
+ void PinyinPredictCandidateWord::select(InputContext *inputContext) const {
++    if (inputContext->propertyFor(&engine_->factory())->paragraphActive()) return;
+     inputContext->commitString(word_);
+     auto *state = inputContext->propertyFor(&engine_->factory());
+     if (!state->predictWords_) {
+@@ -57,6 +58,7 @@
+     : CandidateWord(Text(word)), engine_(engine), word_(std::move(word)) {}
+ 
+ void PinyinPredictDictCandidateWord::select(InputContext *inputContext) const {
++    if (inputContext->propertyFor(&engine_->factory())->paragraphActive()) return;
+     inputContext->commitString(word_);
+     auto *state = inputContext->propertyFor(&engine_->factory());
+     if (!state->predictWords_) {
+@@ -92,6 +94,12 @@
+ }
+ 
+ void StrokeCandidateWord::select(InputContext *inputContext) const {
++    auto *state = inputContext->propertyFor(&engine_->factory());
++    if (state->paragraphActive()) {
++        state->context().selectCustom(selectLength_, hz_);
++        engine_->updateUI(inputContext);
++        return;
++    }
+     inputContext->commitString(hz_);
+     engine_->doReset(inputContext);
+ }
+@@ -106,7 +114,7 @@
+ 
+ void CustomPhraseCandidateWord::select(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&engine_->factory());
+-    auto &context = state->context_;
++    auto &context = state->context();
+     context.selectCustom(selectLength_, text().toString());
+     engine_->updateUI(inputContext);
+ }
+@@ -121,6 +129,7 @@
+ }
+ 
+ void PinyinPunctuationCandidateWord::select(InputContext *inputContext) const {
++    if (inputContext->propertyFor(&engine_->factory())->paragraphActive()) return;
+     inputContext->commitString(word_);
+     engine_->doReset(inputContext);
+ }
+@@ -222,9 +231,9 @@
+ void LuaCandidateWord::select(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&engine_->factory());
+     auto segmentLength =
+-        state->context_.size() - state->context_.selectedLength();
++        state->context().size() - state->context().selectedLength();
+     segmentLength = std::min(segmentLength, selectLength_);
+-    state->context_.selectCustom(segmentLength, word_);
++    state->context().selectCustom(segmentLength, word_);
+     engine_->updateUI(inputContext);
+ }
+ 
+@@ -248,9 +257,9 @@
+ void SymbolCandidateWord::select(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&engine_->factory());
+     auto segmentLength =
+-        state->context_.size() - state->context_.selectedLength();
++        state->context().size() - state->context().selectedLength();
+     segmentLength = std::min(segmentLength, candidateSegmentLength_);
+-    state->context_.selectCustom(segmentLength, symbol_, encodedPinyin_);
++    state->context().selectCustom(segmentLength, symbol_, encodedPinyin_);
+     engine_->updateUI(inputContext);
+ }
+ 
+@@ -263,7 +272,7 @@
+ 
+ void SpellCandidateWord::select(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&engine_->factory());
+-    auto &context = state->context_;
++    auto &context = state->context();
+     context.selectCustom(selectLength_, word_);
+     engine_->updateUI(inputContext);
+ }
+@@ -273,6 +282,9 @@
+                                          size_t selectLength, size_t idx)
+     : PinyinAbstractCandidateWord(selectLength, idx), engine_(engine),
+       inputContext_(inputContext), idx_(idx) {
++    const auto *state = inputContext->propertyFor(&engine_->factory());
++    transimeContextIdentity_ = &state->context();
++    transimeCandidateEpoch_ = state->transimeCandidateEpoch_;
+     setText(std::move(text));
+ }
+ 
+@@ -281,7 +293,9 @@
+         return;
+     }
+     auto *state = inputContext->propertyFor(&engine_->factory());
+-    auto &context = state->context_;
++    auto &context = state->context();
++    if (state->paragraphActive() && (transimeContextIdentity_ != &context ||
++        transimeCandidateEpoch_ != state->transimeCandidateEpoch_)) return;
+     if (idx_ >= context.candidatesToCursor().size()) {
+         return;
+     }
+@@ -291,16 +305,16 @@
+ 
+ std::string PinyinCandidateWord::customPhraseString() const {
+     auto *state = inputContext_->propertyFor(&engine_->factory());
+-    auto &context = state->context_;
++    auto &context = state->context();
+     if (idx_ >= context.candidatesToCursor().size()) {
+         return "";
+     }
+     const auto candidatePyLength =
+         context.candidatesToCursor()[idx_].sentence().back()->to()->index();
+-    const auto selectedLength = state->context_.selectedLength();
+-    const auto currentSearch = (state->context_.cursor() == selectedLength)
+-                                   ? state->context_.size()
+-                                   : state->context_.cursor();
++    const auto selectedLength = state->context().selectedLength();
++    const auto currentSearch = (state->context().cursor() == selectedLength)
++                                   ? state->context().size()
++                                   : state->context().cursor();
+     if (currentSearch == candidatePyLength + selectedLength) {
+         return text().toString();
+     }
+diff --git a/im/pinyin/pinyincandidate.h b/im/pinyin/pinyincandidate.h
+--- a/im/pinyin/pinyincandidate.h
++++ b/im/pinyin/pinyincandidate.h
+@@ -8,6 +8,7 @@
+ #define _PINYIN_PINYINCANDIDATE_H_
+ 
+ #include "../../modules/cloudpinyin/cloudpinyin_public.h"
++#include "pinyin_public.h"
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -20,6 +21,7 @@
+ #include <fcitx/text.h>
+ #include <libime/core/lattice.h>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -212,12 +214,24 @@
+     size_t inputLength_;
+ };
+ 
++class PinyinCandidateWord;
++
++struct PinyinTransimeCommentHandle {
++    PinyinCandidateWord *candidate = nullptr;
++    int pageIndex = -1;
++};
++
+ class PinyinCandidateWord : public PinyinAbstractCandidateWord,
+                             public InsertableAsCustomPhraseInterface,
+                             public ForgettableCandidateInterface {
+ public:
+     PinyinCandidateWord(PinyinEngine *engine, InputContext *inputContext,
+                         Text text, size_t selectLength, size_t idx);
++    ~PinyinCandidateWord() override {
++        if (transimeCommentHandle_) {
++            transimeCommentHandle_->candidate = nullptr;
++        }
++    }
+ 
+     void select(InputContext *inputContext) const override;
+ 
+@@ -225,9 +239,52 @@
+     size_t candidateIndex() const override { return idx_; }
+     bool isPinyinCandidate() const override { return true; }
+ 
++    // Called only after the engine validates the annotation's value snapshot.
++    // Preserve the complete original Text, including any formatting spans.
++    void setTransimeComment(int pageIndex, const PinyinTransimeSnapshotV1 &snapshot,
++                            std::string translation) {
++        if (translation.empty()) {
++            if (transimeOriginalComment_) {
++                setComment(std::move(*transimeOriginalComment_));
++                transimeOriginalComment_.reset();
++            }
++            transimeCommentSnapshot_.reset();
++            transimeParagraphCommentSnapshot_.reset();
++            return;
++        }
++        if (!transimeCommentHandle_) {
++            transimeCommentHandle_ = std::make_shared<PinyinTransimeCommentHandle>();
++            transimeCommentHandle_->candidate = this;
++        }
++        transimeCommentHandle_->pageIndex = pageIndex;
++        if (!transimeOriginalComment_) {
++            transimeOriginalComment_ = comment();
++        }
++        transimeCommentSnapshot_ = snapshot;
++        setComment(Text(std::move(translation)));
++    }
++
++    const std::optional<PinyinTransimeSnapshotV1> &transimeCommentSnapshot() const {
++        return transimeCommentSnapshot_;
++    }
++
++    std::weak_ptr<PinyinTransimeCommentHandle> transimeCommentHandle() const {
++        return transimeCommentHandle_;
++    }
++
+     PinyinEngine *engine_;
+     InputContext *inputContext_;
+     size_t idx_;
++    const void *transimeContextIdentity_ = nullptr;
++    uint64_t transimeCandidateEpoch_ = 0;
++
++private:
++    std::optional<Text> transimeOriginalComment_;
++public:
++    std::optional<PinyinTransimeParagraphSnapshotV2> transimeParagraphCommentSnapshot_;
++private:
++    std::optional<PinyinTransimeSnapshotV1> transimeCommentSnapshot_;
++    std::shared_ptr<PinyinTransimeCommentHandle> transimeCommentHandle_;
+ };
+ 
+ class CustomCloudPinyinCandidateWord
