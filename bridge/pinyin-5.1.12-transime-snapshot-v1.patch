@@ -265,7 +265,8 @@ diff --git a/im/pinyin/pinyin.cpp b/im/pinyin/pinyin.cpp
 +    if (!inputContext || !inputContext->hasFocus()) {
 +        return snapshot;
 +    }
-+    if (instance_->inputMethod(inputContext) != "pinyin") {
++    const auto inputMethod = instance_->inputMethod(inputContext);
++    if (inputMethod != "pinyin" && inputMethod != "shuangpin") {
 +        snapshot.reason = "unsupported-input-method";
 +        return snapshot;
 +    }
@@ -284,7 +285,7 @@ diff --git a/im/pinyin/pinyin.cpp b/im/pinyin/pinyin.cpp
 +        snapshot.reason = "unsupported-mode";
 +        return snapshot;
 +    }
-+    if (context.empty() || context.selected() || context.useShuangpin()) {
++    if (context.empty() || context.selected()) {
 +        snapshot.reason = "no-pending-pinyin";
 +        return snapshot;
 +    }

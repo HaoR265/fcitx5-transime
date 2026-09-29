@@ -17,12 +17,22 @@ def main():
     parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--toolkit", choices=("qt", "gtk"), default="qt")
+    parser.add_argument("--input-method", choices=("pinyin", "shuangpin", "rime"), default="pinyin",
+                        help="Fcitx spelling scheme for the isolated desktop test")
     parser.add_argument("--cases", help="Comma-separated cases for targeted debugging (unknown names rejected)")
     parser.add_argument("--qt-plugin-path", type=Path, help="Private Qt platform input plugin build (VM-only)")
     parser.add_argument("--qt-panel-draft", action="store_true", help="Enable private Qt panel-draft compatibility fix")
+    parser.add_argument("--transime-addon-dir", type=Path, help="Private TransIME addon directory (VM-only)")
+    parser.add_argument("--rime-addon-dir", type=Path, help="Private patched Rime addon directory (VM-only)")
     args = parser.parse_args()
     if args.qt_panel_draft and not args.qt_plugin_path:
         parser.error("--qt-panel-draft requires --qt-plugin-path")
+    if args.rime_addon_dir and not args.transime_addon_dir:
+        parser.error("--rime-addon-dir requires --transime-addon-dir")
+    if args.input_method == "shuangpin" and not args.cases:
+        parser.error("shuangpin requires explicit --cases (supported: chinese,raw,translation)")
+    if args.input_method == "rime" and not args.cases:
+        parser.error("rime requires explicit --cases (supported: chinese,cancel,translation)")
     if subprocess.run(["systemd-detect-virt", "--vm"], capture_output=True).returncode:
         raise SystemExit("Refusing desktop tests outside a VM")
     if not args.inside:
@@ -44,19 +54,30 @@ def main():
     build = args.build_root
     config = root / "config/fcitx5"
     (config / "conf").mkdir(parents=True)
-    (config / "profile").write_text("[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=pinyin\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=pinyin\nLayout=\n\n[GroupOrder]\n0=Default\n")
+    (config / "profile").write_text("[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=" + args.input_method +
+        "\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=" + args.input_method +
+        "\nLayout=\n\n[GroupOrder]\n0=Default\n")
     project = Path(__file__).resolve().parents[2]
     (config / "conf/transime.conf").write_text(
         "Enabled=True\nContinuousComposition=True\nShowModeHints=False\nEnableHistory=False\nContextAware=False\n"
         f"PythonExecutable={args.model_root}/baseline-python/bin/python\nWorkerScript={project}/worker/transime_worker.py\n"
         f"ModelDirectory={args.model_root}/baseline-model\nRequestTimeoutMilliseconds=5000\nColdStartTimeoutMilliseconds=15000\n"
         "\n[TranslateKey]\n0=Control+Return\n\n[ToggleKey]\n0=Control+Alt+u\n")
+    if args.input_method == "rime":
+        rime_dir = root / "data/fcitx5/rime"
+        rime_dir.mkdir(parents=True)
+        (rime_dir / "default.custom.yaml").write_text(
+            'patch:\n  schema_list:\n    - schema: pinyin_simp\n')
     env.update({"FCITX_CONFIG_HOME": str(config), "FCITX_DATA_HOME": str(root / "data/fcitx5"),
         "FCITX_CONFIG_DIRS": str(config), "FCITX_DATA_DIRS": str(build / "staging") + ":/usr/share/fcitx5",
         "FCITX_ADDON_DIRS": f"{build}/bridge/bin:{build}/plugin/plugin:/usr/lib/x86_64-linux-gnu/fcitx5",
         "LD_LIBRARY_PATH": f"{build}/sdk/prefix/usr/lib/x86_64-linux-gnu:{build}/sdk/deps/usr/lib/x86_64-linux-gnu",
         "XDG_CONFIG_DIRS": str(root / "config"), "XDG_DATA_DIRS": "/usr/share", "QT_IM_MODULE": "fcitx",
         "QT_QPA_PLATFORM": "xcb", "GTK_IM_MODULE": "fcitx", "XMODIFIERS": "@im=fcitx", "SKIP_FCITX_PATH": "1"})
+    extra_addon_dirs = [str(path.resolve()) for path in
+                        (args.transime_addon_dir, args.rime_addon_dir) if path]
+    if extra_addon_dirs:
+        env["FCITX_ADDON_DIRS"] = ":".join(extra_addon_dirs + [env["FCITX_ADDON_DIRS"]])
     if args.qt_plugin_path:
         env["QT_PLUGIN_PATH"] = str(args.qt_plugin_path.resolve())
     env.pop("TRANSIME_QT_PRESERVE_PANEL_DRAFT", None)
@@ -96,8 +117,23 @@ def main():
         command("dbus-update-activation-environment", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "DISPLAY")
         launch(["dbus-monitor", "--session", "destination='org.fcitx.Fcitx5'"], "bus.log")
         launch(["xfwm4", "--compositor=off"], "wm.log")
-        launch(["fcitx5", "--disable=all", "--enable=dbus,dbusfrontend,xcb,xim,classicui,keyboard,pinyin,pinyinhelper,punctuation,transime"], "fcitx.log")
-        time.sleep(1)
+        enabled_addons = "dbus,dbusfrontend,xcb,xim,classicui,keyboard,pinyin,pinyinhelper,punctuation,transime"
+        if args.input_method == "rime":
+            enabled_addons += ",rime"
+        fcitx = launch(["fcitx5", "--disable=all", "--enable=" + enabled_addons], "fcitx.log")
+        time.sleep(15 if args.input_method == "rime" else 1)
+        required_addons = [path.resolve() for path in
+                           (args.transime_addon_dir / "libtransime.so" if args.transime_addon_dir else None,
+                            args.rime_addon_dir / "librime.so" if args.rime_addon_dir else None)
+                           if path]
+        def verify_private_addons():
+            mapped = Path(f"/proc/{fcitx.pid}/maps").read_text()
+            if not all(str(path) in mapped for path in required_addons):
+                return False
+            (root / "addon-maps.txt").write_text("\n".join(
+                line for line in mapped.splitlines()
+                if any(str(path) in line for path in required_addons)) + "\n")
+            return True
         cases = [("chinese", "nihao", "space", "你好"), ("raw", "nihao", "Return", "nihao"),
                  ("translation", "nihao", "ctrl+Return", "Hello."), ("cancel", "nihao", "Escape", ""),
                  ("punctuation", "nihao,", "space", "你好,"), ("english", "API", "space", "API"),
@@ -119,10 +155,18 @@ def main():
             cases.append(("sensitive", "synthetic-secret-01", "", "synthetic-secret-01"))
         if args.cases:
             selected = set(args.cases.split(","))
+            if args.input_method == "shuangpin" and selected - {"chinese", "raw", "translation"}:
+                raise ValueError("Shuangpin desktop coverage currently supports chinese,raw,translation only")
+            if args.input_method == "rime" and selected - {"chinese", "cancel", "translation"}:
+                raise ValueError("Rime desktop coverage currently supports chinese,cancel,translation only")
             unknown = selected - {case[0] for case in cases}
             if unknown:
                 raise ValueError("Unknown cases: " + ", ".join(sorted(unknown)))
             cases = [case for case in cases if case[0] in selected]
+        if args.input_method == "shuangpin":
+            cases = [(name, "nihk" if source == "nihao" else source,
+                      submit, "nihk" if name == "raw" else expected)
+                     for name, source, submit, expected in cases]
         custom_loaded = False
         for name, source, submit, expected in cases:
             started = time.monotonic()
@@ -177,9 +221,11 @@ def main():
                     outcomes.append({"case": name, "passed": True, "after": result})
                     continue
                 wait_for(lambda: command("fcitx5-remote") in ("1", "2"))
-                command("fcitx5-remote", "-s", "pinyin")
+                command("fcitx5-remote", "-s", args.input_method)
                 command("fcitx5-remote", "-o")
-                wait_for(lambda: command("fcitx5-remote") == "2" and command("fcitx5-remote", "-n") == "pinyin")
+                wait_for(lambda: command("fcitx5-remote") == "2" and command("fcitx5-remote", "-n") == args.input_method)
+                if required_addons:
+                    wait_for(verify_private_addons)
                 (root / (name + "-engine.txt")).write_text(command("fcitx5-remote", "-n") + "\n" + command("fcitx5-remote"))
                 time.sleep(.2)
                 if command("xdotool", "getactivewindow") != wid:

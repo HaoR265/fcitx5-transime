@@ -43,3 +43,33 @@ all desktop tests were rerun from the exported package.
 No private binaries, full environment inventories, personal text, raw desktop
 logs or installation receipts are distributed in this repository. Synthetic
 test source is included so results can be independently investigated.
+
+## Additional VM input-path checks — 2026-09-30
+
+In the Kali VM, the current source was rebuilt against the private Fcitx5
+5.1.21 SDK. The plugin CTest passed 2/2. The new Rime 5.1.14 bridge was built
+from the hash-checked upstream archive, and the amended Pinyin 5.1.12 patch
+passed `git apply --recount --check` against a fresh upstream extraction.
+These were private VM builds, not installed into the host input method.
+
+| Input method | Surface | Verified basic actions |
+| --- | --- | --- |
+| Rime | Qt/X11, GTK/X11 | Chinese candidate, translation, cancel |
+| Rime | Qt/Wayland, GTK/Wayland | Chinese candidate, translation, cancel |
+| Double-pinyin (`nihk`) | Qt/X11, GTK/X11 | Chinese candidate, translation |
+| Double-pinyin (`nihk`) | Qt/Wayland, GTK/Wayland | Chinese candidate, translation, cancel |
+| Full pinyin | Qt/Wayland, GTK/Wayland | Chinese candidate, translation, cancel regression |
+
+The Wayland runs used a private Weston compositor nested under Xvfb and real
+fixture windows receiving injected keys. For Rime and the TransIME plugin,
+the harness also checked the running Fcitx process mappings against the newly
+built private addon paths, to exclude an old system library being tested by
+mistake. Initial double-pinyin translation failed because the Pinyin snapshot
+explicitly rejected `shuangpin`; allowing its complete highlighted candidate
+in the same read-only snapshot path fixed that failure in the tested key sequence.
+
+These checks establish only the listed VM, toolkit and fixture combinations.
+They do not establish native Wayland-session behavior across compositors,
+browser/office compatibility, all double-pinyin schemes, Rime schemas,
+complete mixed-paragraph behavior, installer reliability or translation quality.
+The raw VM logs and model files are not part of the public source tree.

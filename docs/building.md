@@ -37,6 +37,24 @@ cmake --build build/plugin -j2
 This is only a build recipe; it neither creates the SDK nor installs a working
 input method. Never deploy a build with `TRANSIME_ENABLE_TEST_FIXTURE=ON`.
 
+For the experimental Linux Rime path, `scripts/prepare_rime_bridge.py` builds
+the patched fcitx5-rime 5.1.14 addon only inside a VM. It requires the exact
+upstream source archive (SHA-256 checked by the script) and a separately
+prepared matching Fcitx SDK. Give it a fresh directory under `/var/tmp`:
+
+```sh
+python3 scripts/prepare_rime_bridge.py \
+  --source-tar /absolute/path/to/fcitx5-rime-5.1.14.tar.gz \
+  --sdk-prefix /absolute/path/to/matching/sdk/prefix/usr \
+  --work-root /var/tmp/transime-rime-test
+```
+
+The resulting `build/bin/librime.so` and the TransIME plugin must be loaded
+together in an isolated test session. The script does not install or activate
+either addon. The matching Pinyin bridge patch now exposes a limited snapshot
+for `shuangpin` as well as `pinyin`; it still does not enable paragraph hold for
+double-pinyin. A successful source build is not a desktop compatibility test.
+
 Historical `scripts/prepare_sdk.py`, `scripts/prepare_host_sdk.py` and
 `scripts/package_plugin.py` assume a layout with the source at
 `WORKSPACE/outputs/fcitx5-transime` and generated artifacts at `WORKSPACE/work`.

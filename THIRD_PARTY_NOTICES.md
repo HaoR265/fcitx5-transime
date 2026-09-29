@@ -16,6 +16,11 @@ This declaration does not replace any upstream copyright or license notice.
   identify Copyright 2017 CSSlayer <wengxt@gmail.com>; pinyincandidate.cpp/.h
   identify Copyright 2024 CSSlayer <wengxt@gmail.com>. Retain upstream notices when
   applying the patch. `bridge/pinyin_public.h` declares LGPL-2.1-or-later.
+- `bridge/rime-5.1.14-transime-snapshot-v1.patch` modifies
+  [fcitx5-rime 5.1.14](https://github.com/fcitx/fcitx5-rime/tree/5.1.14).
+  The affected upstream implementation files declare LGPL-2.1-or-later and
+  identify Copyright 2017 CSSlayer <wengxt@gmail.com>. Retain their notices
+  when applying the patch. `bridge/rime_public.h` declares LGPL-2.1-or-later.
 - `bridge/qt6-preserve-panel-draft.patch` modifies the shared Qt input-context
   sources of [fcitx5-qt 5.1.14](https://github.com/fcitx/fcitx5-qt/tree/5.1.14).
   Those source files declare BSD-3-Clause: the .cpp identifies Copyright
@@ -27,8 +32,9 @@ This declaration does not replace any upstream copyright or license notice.
   components of fcitx5-qt. Retain all original notices in patched source.
 
 TransIME changes include paragraph/mixed-input holding, candidate snapshots,
-configurable controls, and opt-in Qt draft lifecycle handling. This source
-snapshot records those modifications as of 2026-09-26. These are not upstream
+configurable controls, and opt-in Qt draft lifecycle handling. The Pinyin and
+Qt patches originated in the 2026-09-26 source snapshot; the experimental Rime
+patch was added afterward. These are not upstream
 releases and do not imply upstream endorsement.
 
 ## External dependencies, not bundled

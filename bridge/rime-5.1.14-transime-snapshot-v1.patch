@@ -1,0 +1,146 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -27,6 +27,7 @@
+ add_fcitx5_addon(rime ${RIME_SOURCES})
++fcitx5_export_module(Rime TARGET rime BUILD_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}" HEADERS rime_public.h INSTALL)
+ target_link_libraries(rime ${RIME_LINK_LIBRARIES})
+diff --git a/src/rimeengine.h b/src/rimeengine.h
+--- a/src/rimeengine.h
++++ b/src/rimeengine.h
+@@ -5,6 +5,7 @@
+ #ifndef _FCITX_RIMEENGINE_H_
+ #define _FCITX_RIMEENGINE_H_
+ 
++#include "rime_public.h"
+ #include "rimesession.h"
+ #include "rimestate.h"
+@@ -143,6 +144,8 @@ public:
+     RimeState *state(InputContext *ic);
+     RimeSessionPool &sessionPool() { return sessionPool_; }
+ 
++    using Rime = RimeEngine; // Keep the public addon function name IRime.
++    RimeTransimeSnapshotV1 transimeSnapshotV1(InputContext *ic);
++    FCITX_ADDON_EXPORT_FUNCTION(Rime, transimeSnapshotV1);
+ #ifndef FCITX_RIME_NO_DBUS
+     FCITX_ADDON_DEPENDENCY_LOADER(dbus, instance_->addonManager());
+diff --git a/src/rimestate.h b/src/rimestate.h
+--- a/src/rimestate.h
++++ b/src/rimestate.h
+@@ -9,6 +9,7 @@
+ #include <fcitx/event.h>
+ #include <fcitx/globalconfig.h>
+ #include <fcitx/inputcontextmanager.h>
++#include "rime_public.h"
+ #include <fcitx/inputcontextproperty.h>
+@@ -43,6 +44,7 @@ public:
+     void selectSchema(const std::string &schemaId);
+     RimeSessionId session(bool requestNewSession = true);
+ 
++    RimeTransimeSnapshotV1 transimeSnapshot();
+     void snapshot();
+@@ -56,6 +58,7 @@ private:
+     RimeEngine *engine_;
+     InputContext &ic_;
+     std::shared_ptr<RimeSessionHolder> session_;
++    std::uint64_t transimeRevision_ = 0;
+ 
+diff --git a/src/rimeengine.cpp b/src/rimeengine.cpp
+--- a/src/rimeengine.cpp
++++ b/src/rimeengine.cpp
+@@ -568,6 +568,16 @@ RimeState *RimeEngine::state(InputContext *ic) {
+     return ic->propertyFor(&factory_);
+ }
+ 
++RimeTransimeSnapshotV1 RimeEngine::transimeSnapshotV1(InputContext *ic) {
++    if (!ic || !ic->hasFocus() || instance_->inputMethod(ic) != "rime" ||
++        api_->is_maintenance_mode()) {
++        return {};
++    }
++    auto *rimeState = state(ic);
++    return rimeState ? rimeState->transimeSnapshot() : RimeTransimeSnapshotV1{};
++}
++
+ std::string RimeEngine::subMode(const InputMethodEntry & /*entry*/,
+diff --git a/src/rimestate.cpp b/src/rimestate.cpp
+--- a/src/rimestate.cpp
++++ b/src/rimestate.cpp
+@@ -73,8 +73,43 @@ RimeSessionId RimeState::session(bool requestNewSession) {
+ }
+ 
+ void RimeState::clear() {
++    ++transimeRevision_;
+     if (auto session = this->session()) {
+         engine_->api()->clear_composition(session);
+     }
+ }
+ 
++RimeTransimeSnapshotV1 RimeState::transimeSnapshot() {
++    RimeTransimeSnapshotV1 snapshot;
++    auto *api = engine_->api();
++    auto id = session(false);
++    if (!id || !api->find_session(id) || api->get_option(id, RIME_ASCII_MODE)) {
++        return snapshot;
++    }
++    RIME_STRUCT(RimeContext, context);
++    if (!api->get_context(id, &context)) {
++        return snapshot;
++    }
++    const char *input = api->get_input(id);
++    const char *preview = context.commit_text_preview;
++    if (input && preview && context.composition.length > 0 &&
++        context.menu.num_candidates > 0 &&
++        context.menu.highlighted_candidate_index >= 0 &&
++        context.menu.highlighted_candidate_index < context.menu.num_candidates) {
++        snapshot.rawInput = input;
++        snapshot.source = preview;
++        snapshot.inputBytes = snapshot.rawInput.size();
++        snapshot.cursorBytes = api->get_caret_pos(id);
++        snapshot.candidateIndex = context.menu.highlighted_candidate_index;
++        snapshot.revision = transimeRevision_;
++        // A mixed/unresolved Latin preview is not a complete Chinese source.
++        const bool hasLatin = std::any_of(snapshot.source.begin(), snapshot.source.end(),
++            [](unsigned char ch) { return (ch >= 'a' && ch <= 'z') ||
++                                          (ch >= 'A' && ch <= 'Z'); });
++        const bool hasControl = std::any_of(snapshot.source.begin(), snapshot.source.end(),
++            [](unsigned char ch) { return ch < 0x20 || ch == 0x7f; });
++        snapshot.ready = !snapshot.rawInput.empty() && !snapshot.source.empty() &&
++            snapshot.inputBytes <= 4096 && snapshot.source.size() <= 4096 &&
++            utf8::lengthValidated(snapshot.source) != utf8::INVALID_LENGTH &&
++            !hasLatin && !hasControl && snapshot.source != snapshot.rawInput &&
++            snapshot.cursorBytes == snapshot.inputBytes &&
++            context.composition.cursor_pos == context.composition.length &&
++            context.composition.sel_start == 0 &&
++            context.composition.sel_end == context.composition.length;
++    }
++    api->free_context(&context);
++    return snapshot;
++}
++
+ void RimeState::activate() { maybeSyncProgramNameToSession(); }
+@@ -125,6 +160,7 @@ void RimeState::toggleLatinMode() {
+         return;
+     }
+ 
++    ++transimeRevision_;
+     Bool oldValue = api->get_option(session(), RIME_ASCII_MODE);
+@@ -137,6 +173,7 @@ void RimeState::setLatinMode(bool latin) {
+         return;
+     }
++    ++transimeRevision_;
+     api->set_option(session(), RIME_ASCII_MODE, latin);
+@@ -148,6 +185,7 @@ void RimeState::selectSchema(const std::string &schema) {
+         return;
+     }
++    ++transimeRevision_;
+     api->set_option(session(), RIME_ASCII_MODE, false);
+@@ -155,6 +193,7 @@ void RimeState::selectSchema(const std::string &schema) {
+ }
+ 
+ void RimeState::keyEvent(KeyEvent &event) {
++    ++transimeRevision_;
+     changedOptions_.clear();
+@@ -237,6 +276,7 @@ void RimeState::selectCandidate(InputContext *inputContext, int idx,
+                                 bool global) {
++    ++transimeRevision_;
+     auto *api = engine_->api();

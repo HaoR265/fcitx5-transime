@@ -30,6 +30,7 @@
 #include <fcitx/text.h>
 
 #include "pinyin_public.h"
+#include "rime_public.h"
 #include "session.h"
 #include "translation_cache.h"
 #include "transime_test_public.h"
@@ -104,9 +105,12 @@ void normalizeControls(TransimeConfig &config) {
 }
 
 struct TranslationTarget : PinyinTransimeSnapshotV1 {
+    enum class Origin { Pinyin, Rime };
+    Origin origin = Origin::Pinyin;
     std::optional<PinyinTransimeParagraphSnapshotV2> paragraph;
     TranslationTarget() = default;
-    TranslationTarget(PinyinTransimeSnapshotV1 value) : PinyinTransimeSnapshotV1(std::move(value)) {}
+    TranslationTarget(PinyinTransimeSnapshotV1 value, Origin from = Origin::Pinyin)
+        : PinyinTransimeSnapshotV1(std::move(value)), origin(from) {}
     explicit TranslationTarget(PinyinTransimeParagraphSnapshotV2 value)
         : PinyinTransimeSnapshotV1(value.activeCandidate), paragraph(std::move(value)) {
         ready = paragraph->ready;
@@ -246,6 +250,7 @@ std::optional<std::string> fixtureTranslation(const std::string &source) {
 
 bool sameTarget(const TranslationTarget &a,
                 const TranslationTarget &b) {
+    if (a.origin != b.origin) return false;
     if (a.paragraph.has_value() != b.paragraph.has_value()) return false;
     if (a.paragraph) {
         const auto &x = *a.paragraph, &y = *b.paragraph;
@@ -473,7 +478,9 @@ private:
     bool eligible(InputContext *ic) const {
         return config_.enabled.value() && ic->hasFocus() &&
                !(ic->capabilityFlags() & CapabilityFlag::PasswordOrSensitive) &&
-               instance_->inputMethod(ic) == "pinyin";
+               (instance_->inputMethod(ic) == "pinyin" ||
+                instance_->inputMethod(ic) == "shuangpin" ||
+                instance_->inputMethod(ic) == "rime");
     }
 
     void cancelAutomation(InputContext *ic) {
@@ -800,6 +807,30 @@ private:
     }
 
     std::optional<TranslationTarget> snapshotAt(InputContext *ic, int pageIndex) {
+        if (instance_->inputMethod(ic) == "rime") {
+            // Rime owns its candidate list; only its highlighted, complete
+            // commit preview is exposed. Never infer a source from UI text.
+            if (pageIndex >= 0) return std::nullopt;
+            auto *rime = instance_->addonManager().addon("rime", false);
+            if (!rime) return std::nullopt;
+            try {
+                auto current = rime->call<IRime::transimeSnapshotV1>(ic);
+                if (current.apiVersion != 1 || !current.ready ||
+                    current.source.empty() || current.source.size() > 4096 ||
+                    current.cursorBytes != current.inputBytes) return std::nullopt;
+                PinyinTransimeSnapshotV1 target;
+                target.ready = true;
+                target.reason = "rime";
+                target.revision = current.revision;
+                target.candidateText = current.source;
+                target.source = current.source;
+                target.inputBytes = current.inputBytes;
+                target.candidateInputEnd = current.inputBytes;
+                target.cursorBytes = current.cursorBytes;
+                target.candidateIndex = current.candidateIndex;
+                return TranslationTarget(std::move(target), TranslationTarget::Origin::Rime);
+            } catch (const std::exception &) { return std::nullopt; }
+        }
         auto *addon = instance_->addonManager().addon("pinyin", false);
         if (!addon) return std::nullopt;
         try {
@@ -1239,7 +1270,9 @@ private:
             return;
         }
         if (!event.isRelease() && !repeat && ic->hasFocus() &&
-            instance_->inputMethod(ic) == "pinyin" &&
+            (instance_->inputMethod(ic) == "pinyin" ||
+             instance_->inputMethod(ic) == "shuangpin" ||
+             instance_->inputMethod(ic) == "rime") &&
             !ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive) &&
             event.key().checkKeyList(config_.toggleKey.value())) {
             auto ref = ic->watch();
