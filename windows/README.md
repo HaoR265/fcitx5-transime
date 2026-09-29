@@ -29,12 +29,33 @@ candidate, and Ctrl+Enter inserted `Hello.`. This verifies that specific
 end-to-end path; it does not validate other keys, mixed paragraphs, or a
 second application.
 
+On 2026-09-29 the same Windows 10 VM also passed a Microsoft double-pinyin
+route: with Rime's `double_pinyin_mspy` schema selected, `nihk` produced the
+`你好` candidate and Ctrl+Enter inserted `Hello.` in Notepad. The configured
+real-worker service test passed with the same schema and key sequence. The
+schema came from [rime/rime-double-pinyin](https://github.com/rime/rime-double-pinyin)
+at commit `01a13287cbd27819be1c34fa1ddc1b3643d5001b` and was installed only
+in the disposable VM's Rime user directory. It is GPL-3.0 licensed and is not
+included in this repository. This establishes one double-pinyin scheme on one
+Windows application, not general double-pinyin or Linux Rime support.
+
+On 2026-09-30, a separate Windows 11 VM passed the configured actual-worker
+service test with `luna_pinyin`: Rime supplied a Chinese preview and the
+offline model returned `Hello.`. This is **not** a real-application pass. The
+Notepad input-profile selection could not be confirmed, so no Win11 Notepad
+translation result is claimed. The VM also exposed a deployment prerequisite:
+its older system `MSVCP140.dll` caused the model process to crash with
+`0xc0000005`. A newer Microsoft-signed runtime DLL, scoped to that VM's Python
+directory, made the model work. No Microsoft DLL is distributed here; a proper
+Windows package must declare and verify its supported Visual C++ runtime.
+
 ## Prototype setup inside a disposable Windows VM
 
 Install official PIME with its Rime component first. Copy `pime/ime.json`,
 `pime/transime_ime.py`, and `pime/worker_bridge.py` into
 `C:\Program Files (x86)\PIME\python\input_methods\transime_rime\`.
-Do **not** copy `test_adapter.py` or a fake worker into a user installation.
+Do **not** copy `test_adapter.py`, `test_adapter_actual.py`, or a fake worker into
+a user installation.
 Create `%APPDATA%\TransIME\windows.json` with a local, explicit worker
 command, for example:
 
