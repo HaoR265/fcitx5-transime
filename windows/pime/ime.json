@@ -1,0 +1,11 @@
+{
+  "name": "TransIME (experimental)",
+  "version": "0.1",
+  "guid": "{B456E134-26DD-4FA8-83FD-4FBB97884B11}",
+  "locale": "zh-Hans-CN",
+  "fallbackLocale": "zh-CN",
+  "icon": "",
+  "win8_icon": "",
+  "moduleName": "transime_ime",
+  "serviceName": "TransimeTextService"
+}

@@ -434,7 +434,10 @@ def main() -> int:
     except Exception:
         context_module = None
     try:
-        numbers_module = load_local_module("numbers")
+        # Avoid shadowing Python's standard-library ``numbers`` module. NumPy
+        # imports it while CTranslate2 starts, so a local numbers.py breaks the
+        # real model on a clean Windows Python installation.
+        numbers_module = load_local_module("number_normalizer")
     except Exception:
         numbers_module = None
     try:

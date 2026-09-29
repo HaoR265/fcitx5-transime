@@ -2,7 +2,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-spec = importlib.util.spec_from_file_location("numbers_guard", Path(__file__).parents[1] / "worker/numbers.py")
+spec = importlib.util.spec_from_file_location("numbers_guard", Path(__file__).parents[1] / "worker/number_normalizer.py")
 numbers = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(numbers)
 
