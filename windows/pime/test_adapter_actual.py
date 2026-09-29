@@ -42,9 +42,9 @@ try:
         event = key(ord(character.upper()), char_code=ord(character))
         service.filterKeyDown(event)
         service.onKeyDown(event)
-    assert service.source, "Rime preview did not become available"
-    assert any("\u4e00" <= character <= "\u9fff" for character in service.source), \
-        "preview is not Chinese candidate text"
+    assert service.source == "你好", \
+        "Rime preview does not match the selected schema and test keys: {!r}".format(
+            service.source)
 
     source = service.source
     service.bridge.invalidate()
@@ -62,7 +62,8 @@ try:
         if translated is not None:
             break
         time.sleep(0.05)
-    assert translated and translated != source, "actual worker response missing"
+    assert translated and translated.strip().rstrip(".!?").casefold() in {"hello", "hi"}, \
+        "actual worker response is missing or unexpected: {!r}".format(translated)
 
     assert service.filterKeyDown(shortcut) is True
     assert service.onKeyDown(shortcut) is True

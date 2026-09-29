@@ -41,6 +41,8 @@ python3 settings/app.py --config-home /var/tmp/transime-preview/config --data-ho
 
 已验证的组合是 Kali 测试虚拟机、Fcitx5 5.1.21、隔离 Pinyin 5.1.12 桥接；Qt 切窗补丁针对 fcitx5-qt 5.1.14 / Qt 6.10.2 / X11。桌面回归 Qt 21/21、GTK 16/16，六项焦点保护专项重复 6/6 通过。这些是特定环境测试，不是所有应用的兼容性保证，也不是翻译准确率。
 
+Windows 10/11 虚拟机的实验性 PIME/Rime 适配器已分别在记事本和 Edge 普通文本框走通“候选你好 → Ctrl+Enter 提交 Hello.”的基本路径；Win10 还验证了微软双拼 `nihk` 键序。它尚未实现与 Linux 相同的完整混合段落和按键行为，也没有发布安装包。Linux Rime 与 Wayland 仍待真实输入路径验证，不能把已安装相关组件当作兼容通过。细节与限制见 [Windows 验证记录](windows/README.md)。
+
 当前源码包的独立目录检查见 [验证记录](docs/validation.md)。本仓库不包含模型权重、私有构建库、原始桌面日志、用户数据或开发者安装备份。
 
 ## 文档
