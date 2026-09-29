@@ -27,7 +27,7 @@ Rime service and a synthetic worker in the Win11 VM. In a clean Windows 10
 committed a translation in Notepad: typing `nihao` showed Rime's `你好`
 candidate, and Ctrl+Enter inserted `Hello.`. This verifies that specific
 end-to-end path; it does not validate other keys, mixed paragraphs, or a
-second application.
+second application by itself.
 
 On 2026-09-29 the same Windows 10 VM also passed a Microsoft double-pinyin
 route: with Rime's `double_pinyin_mspy` schema selected, `nihk` produced the
@@ -41,13 +41,24 @@ Windows application, not general double-pinyin or Linux Rime support.
 
 On 2026-09-30, a separate Windows 11 VM passed the configured actual-worker
 service test with `luna_pinyin`: Rime supplied a Chinese preview and the
-offline model returned `Hello.`. This is **not** a real-application pass. The
-Notepad input-profile selection could not be confirmed, so no Win11 Notepad
-translation result is claimed. The VM also exposed a deployment prerequisite:
+offline model returned `Hello.`. The same VM then passed the real-application
+path in both Notepad and Edge's local-file `<textarea>`: with the TransIME
+profile visibly selected, `nihao` showed `你好`, and Ctrl+Enter inserted
+`Hello.`. Only disposable text fields were used; these two basic-input checks
+do not establish full Windows compatibility. The VM also exposed a deployment prerequisite:
 its older system `MSVCP140.dll` caused the model process to crash with
 `0xc0000005`. A newer Microsoft-signed runtime DLL, scoped to that VM's Python
 directory, made the model work. No Microsoft DLL is distributed here; a proper
 Windows package must declare and verify its supported Visual C++ runtime.
+
+The Windows 10 VM also passed the Edge local-file `<textarea>` check on
+2026-09-30. Its persisted Rime schema was `double_pinyin_mspy`, so the matching
+key sequence was `nihk`, not the full-pinyin `nihao`. With `nihk`, Edge showed
+the `你好` candidate and Ctrl+Enter inserted `Hello.`. An initial `nihao` trial
+produced a different candidate and translation; that was a schema/key-sequence
+mismatch, not a successful full-pinyin check. The temporary HTML file was
+removed after the test. Neither Edge result covers arbitrary web editors or
+all double-pinyin schemas.
 
 ## Prototype setup inside a disposable Windows VM
 
@@ -89,9 +100,11 @@ This procedure changes only the VM; it is not a supported installer.
    isolated settings and import path, rather than copying a user's profile.
 4. Package and uninstall the adapter without replacing the Windows built-in
    input method or silently changing the user's default input profile.
-5. Test in Windows 10 and Windows 11 VMs in at least Notepad and a second
-   real text application, including translation with an actual local model.
+5. Extend the Windows 10 and Windows 11 Notepad/Edge checks to the complete
+   key and mixed-paragraph matrix, additional editors, install/update/remove,
+   and clean-VM regression runs with the actual local model.
 
 Until those checks pass, Windows remains experimental rather than a supported
-product installation. The Windows 10 Notepad result establishes one working
-route through Rime, PIME, the offline worker, and a real text application.
+product installation. The Notepad and Edge results establish narrow working
+routes through Rime, PIME, the offline worker, and real text applications on
+both Windows versions.
