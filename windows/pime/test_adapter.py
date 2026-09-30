@@ -27,6 +27,9 @@ def key(code, control=False, char_code=None):
 service = TransimeTextService(Client())
 service.onActivate()
 try:
+    shortcut = key(VK_RETURN, control=True)
+    assert not service.filterKeyDown(shortcut), \
+        "Ctrl+Enter without a composition should reach the application"
     for character in "nihao":
         event = key(ord(character.upper()), char_code=ord(character))
         service.filterKeyDown(event)
@@ -37,9 +40,8 @@ try:
         "preview is not Chinese candidate text"
     source = service.source
     service.bridge.invalidate()
-    event = key(VK_RETURN, control=True)
-    assert service.filterKeyDown(event) is True
-    assert service.onKeyDown(event) is True
+    assert service.filterKeyDown(shortcut) is True
+    assert service.onKeyDown(shortcut) is True
     assert service.commitString == "", "unready shortcut committed text"
     assert service.source == source, "unready shortcut lost the composition"
     service.bridge.request(source)
@@ -48,10 +50,12 @@ try:
     while service.bridge.get_ready(service.source) is None and time.monotonic() < deadline:
         time.sleep(0.05)
     assert service.bridge.get_ready(service.source) == expected, "worker response missing"
-    assert service.filterKeyDown(event) is True
-    assert service.onKeyDown(event) is True
+    assert service.filterKeyDown(shortcut) is True
+    assert service.onKeyDown(shortcut) is True
     assert service.commitString == expected, "Ctrl+Enter did not commit current translation"
     assert service.source == "", "committed source was not invalidated"
+    assert not service.filterKeyDown(shortcut), \
+        "Ctrl+Enter after commit should reach the application"
     print("PASS: Rime preview -> framed worker -> Ctrl+Enter commit")
 finally:
     service.onDeactivate()

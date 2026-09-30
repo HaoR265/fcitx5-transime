@@ -61,8 +61,13 @@ class TransimeTextService(RimeTextService):
                 self.bridge.invalidate()
 
     def filterKeyDown(self, keyEvent):
-        self.translate_key_down = (keyEvent.keyCode == VK_RETURN and
-                                   keyEvent.isKeyDown(VK_CONTROL))
+        translate_key = (keyEvent.keyCode == VK_RETURN and
+                         keyEvent.isKeyDown(VK_CONTROL))
+        if translate_key:
+            # Leave the application's Ctrl+Enter alone when there is no
+            # translatable Rime composition or no configured worker.
+            self._refresh()
+        self.translate_key_down = bool(translate_key and self.source and self.bridge)
         if self.translate_key_down:
             return True
         return super().filterKeyDown(keyEvent)

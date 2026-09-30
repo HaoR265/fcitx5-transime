@@ -38,6 +38,10 @@ try:
     assert schema in inputs, "unsupported test schema"
     assert rime.select_schema(service.session_id, schema.encode("ascii")), \
         "selected schema was not deployed"
+    shortcut = key(VK_RETURN, control=True)
+    assert not service.filterKeyDown(shortcut), \
+        "Ctrl+Enter without a composition should reach the application"
+    assert not service.translate_key_down, "empty shortcut was marked as translation"
     for character in inputs[schema]:
         event = key(ord(character.upper()), char_code=ord(character))
         service.filterKeyDown(event)
@@ -48,7 +52,6 @@ try:
 
     source = service.source
     service.bridge.invalidate()
-    shortcut = key(VK_RETURN, control=True)
     assert service.filterKeyDown(shortcut) is True
     assert service.onKeyDown(shortcut) is True
     assert service.commitString == "", "unready shortcut committed text"
@@ -69,6 +72,8 @@ try:
     assert service.onKeyDown(shortcut) is True
     assert service.commitString == translated, "Ctrl+Enter did not commit translation"
     assert service.source == "", "committed source was not invalidated"
+    assert not service.filterKeyDown(shortcut), \
+        "Ctrl+Enter after commit should reach the application"
     result = "PASS actual adapter [{}]: {!r} -> {!r}".format(schema, source, translated)
     print(result)
     Path(__file__).with_suffix(".result.txt").write_text(result + "\n", encoding="utf-8")

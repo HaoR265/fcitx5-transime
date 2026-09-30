@@ -60,6 +60,13 @@ mismatch, not a successful full-pinyin check. The temporary HTML file was
 removed after the test. Neither Edge result covers arbitrary web editors or
 all double-pinyin schemas.
 
+On 2026-10-01, a Windows 11 VM service-level regression with the configured
+offline worker verified that Ctrl+Enter is not consumed when Rime has no
+translatable composition, is consumed to commit `Hello.` from the `你好`
+preview, and passes through again after that commit. This checks the PIME
+adapter's key-filter boundary; the change has not yet been rechecked in a
+real application and does not extend the application-level matrix above.
+
 ## Prototype setup inside a disposable Windows VM
 
 Install official PIME with its Rime component first. Copy `pime/ime.json`,
