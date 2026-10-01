@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--qt-plugin-path", type=Path)
     parser.add_argument("--input-method", choices=("pinyin", "shuangpin", "rime"), default="pinyin")
     parser.add_argument("--cases", default="chinese,raw,cancel")
+    parser.add_argument("--disable-transime", action="store_true",
+                        help="Negative control: keep the same engine but disable TransIME")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.input_method == "rime" and not args.rime_addon_dir:
@@ -94,7 +96,8 @@ def main():
         "\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=" + args.input_method +
         "\nLayout=\n\n[GroupOrder]\n0=Default\n")
     (config / "conf/transime.conf").write_text(
-        "Enabled=True\nContinuousComposition=True\nShowModeHints=False\nEnableHistory=False\nContextAware=False\n"
+        f"Enabled={'False' if args.disable_transime else 'True'}\n"
+        "ContinuousComposition=True\nShowModeHints=False\nEnableHistory=False\nContextAware=False\n"
         f"PythonExecutable={models}/baseline-python/bin/python\nWorkerScript={project}/worker/transime_worker.py\n"
         f"ModelDirectory={models}/baseline-model\nRequestTimeoutMilliseconds=5000\nColdStartTimeoutMilliseconds=15000\n"
         "\n[TranslateKey]\n0=Control+Return\n")
@@ -140,23 +143,28 @@ def main():
         required = [args.transime_addon_dir.resolve() / "libtransime.so"]
         if args.input_method == "rime":
             required.append(args.rime_addon_dir.resolve() / "librime.so")
-        def verify_private_addons():
+        def verify_private_addons(require_rime=True):
+            active_required = required if require_rime else required[:1]
             mapped = Path(f"/proc/{fcitx.pid}/maps").read_text()
-            if not all(str(library) in mapped for library in required):
+            if not all(str(library) in mapped for library in active_required):
                 return False
             (root / "addon-maps.txt").write_text("\n".join(
                 line for line in mapped.splitlines()
-                if any(str(library) in line for library in required)) + "\n")
+                if any(str(library) in line for library in active_required)) + "\n")
             return True
         seat = Seat()
         sources = {"chinese": ("nihk" if args.input_method == "shuangpin" else "nihao", 0x20, "你好"),
                    "raw": ("nihk" if args.input_method == "shuangpin" else "nihao", 0xFF0D,
                            "nihk" if args.input_method == "shuangpin" else "nihao"),
                    "translation": ("nihk" if args.input_method == "shuangpin" else "nihao", "ctrl+Return", "Hello."),
-                   "cancel": ("nihk" if args.input_method == "shuangpin" else "nihao", 0xFF1B, "")}
+                   "cancel": ("nihk" if args.input_method == "shuangpin" else "nihao", 0xFF1B, ""),
+                   "passthrough": ("", "ctrl+Return", ""),
+                   "after_cancel": ("nihk" if args.input_method == "shuangpin" else "nihao", "ctrl+Return", "")}
         selected = args.cases.split(",")
         if not selected or any(name not in sources for name in selected):
             raise ValueError("invalid --cases selection")
+        if any(name in selected for name in ("passthrough", "after_cancel")) and args.toolkit != "qt":
+            raise ValueError("key pass-through cases require the Qt key-event fixture")
         for name in selected:
             source, submit, expected = sources[name]
             marker = "TransIME Wayland " + name
@@ -184,10 +192,14 @@ def main():
                 until(lambda: subprocess.run(["fcitx5-remote", "-n"], env=env,
                     capture_output=True, text=True).stdout.strip() == args.input_method)
                 # Rime is loaded on first selection, not necessarily at fcitx startup.
-                until(verify_private_addons)
+                until(lambda: verify_private_addons(name not in ("passthrough", "after_cancel")))
                 if args.input_method == "rime":
                     time.sleep(1)
-                seat.type(source)
+                if source:
+                    seat.type(source)
+                if name == "after_cancel":
+                    seat.key(0xFF1B)
+                    until(verify_private_addons)
                 time.sleep(0.6)
                 before = read()
                 if before.get("text"):
@@ -211,6 +223,10 @@ def main():
                 after = read()
                 if after.get("text") != expected:
                     raise AssertionError("wrong text: " + repr(after))
+                if (name in ("passthrough", "after_cancel") and
+                        after.get("ctrl_enter_key_presses", 0) !=
+                        before.get("ctrl_enter_key_presses", 0) + 1):
+                    raise AssertionError("Ctrl+Enter did not reach the application: " + repr(after))
                 outcomes.append({"case": name, "passed": True, "before": before, "after": after,
                                  "submit_attempts": attempts})
             except Exception as error:

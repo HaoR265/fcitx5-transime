@@ -73,3 +73,26 @@ They do not establish native Wayland-session behavior across compositors,
 browser/office compatibility, all double-pinyin schemes, Rime schemas,
 complete mixed-paragraph behavior, installer reliability or translation quality.
 The raw VM logs and model files are not part of the public source tree.
+
+## Empty-shortcut regression — 2026-10-01
+
+A new VM-only Qt/Wayland case checks whether Ctrl+Enter reaches the actual
+editor when no composition has been typed. The fixture records the editor's
+key-press handler, rather than treating an input-method return value as proof
+of application delivery. The cold case is opt-in as `--cases passthrough`; an
+`after_cancel` variant first types and cancels a composition, and
+`--disable-transime` supplies a negative control.
+
+With the current source rebuilt in the Kali VM, the selected Rime profile and
+`shuangpin` delivered the cold empty shortcut to the editor. The cold Rime
+case checks the selected profile but does not force the lazily loaded Rime
+addon to map; the separate Rime translation and Chinese-candidate cases did
+verify the private addon mapping and passed. Full pinyin did not deliver the
+cold empty shortcut in two repeat runs; disabling TransIME while keeping the
+same pinyin engine made the negative control pass. After a canceled
+composition, pinyin and `shuangpin` did deliver it. The Rime after-cancel
+case timed out during addon verification and is inconclusive. A later
+cold-boot pinyin run also timed out while waiting for addon activation and
+adds no key-delivery conclusion. The cold full-pinyin behavior remains an
+open compatibility bug, not a passed regression. No unverified plugin
+workaround from this investigation is included in the source.

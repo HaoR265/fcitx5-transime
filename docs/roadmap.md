@@ -6,7 +6,9 @@ does not mean the new settings and Qt patch were part of a stable 0.1.4 release.
 1. Create a portable, version-checked full installer and validate a clean-machine
    install/upgrade/uninstall cycle independently of the developer SDK.
 2. Test additional Linux distributions, Wayland, Qt/GTK/browser/office apps and
-   sensitive-field/focus lifecycles. The current tested Qt fix is opt-in.
+   sensitive-field/focus lifecycles. The current tested Qt fix is opt-in. Fix the
+   full-pinyin empty-composition Ctrl+Enter interception reproduced by the
+   VM-only Qt/Wayland passthrough regression.
 3. Implement a genuine Windows text-service adapter before claiming Windows
    support. A portable settings window is not a Windows input method.
 4. Improve translation terminology, ambiguity, negation and numeric/identifier

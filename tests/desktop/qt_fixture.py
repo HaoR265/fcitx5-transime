@@ -29,6 +29,7 @@ def main():
     app = QApplication([])
     commits = []
     preedit_events = 0
+    ctrl_enter_key_presses = 0
     focus_events = []
     second_commits = []
 
@@ -37,6 +38,15 @@ def main():
     base_editor = QLineEdit if args.sensitive else QPlainTextEdit
 
     class Editor(base_editor):
+        def keyPressEvent(self, event):
+            nonlocal ctrl_enter_key_presses
+            if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                    and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                ctrl_enter_key_presses += 1
+                event.accept()
+                return
+            super().keyPressEvent(event)
+
         def focusOutEvent(self, event):
             focus_events.append({"event": "out", "reason": event.reason().name,
                                  "monotonic": time.monotonic()})
@@ -105,6 +115,7 @@ def main():
                  "monotonic": time.monotonic(),
                  "text": editor.text() if args.sensitive else editor.toPlainText(),
                  "ime_commits": commits[-10:], "preedit_events": preedit_events,
+                 "ctrl_enter_key_presses": ctrl_enter_key_presses,
                  "qt_platform": app.platformName(), "focus_events": focus_events[-20:]}
         if secondary is not None:
             first_point = editor.mapToGlobal(editor.rect().center())
